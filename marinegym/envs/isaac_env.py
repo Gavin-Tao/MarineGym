@@ -43,11 +43,30 @@ from torchrl.envs import EnvBase
 from marinegym.robots.robot import RobotBase
 from marinegym.utils.torchrl import AgentSpec
 
-from omni.isaac.debug_draw import _debug_draw
+# The debug-draw extension is a visualization-only helper and is only loaded by the
+# GUI / livestream kit experiences. Under the lightweight gym.headless.kit used for
+# training it is absent, so import it lazily and fall back to a no-op interface — a
+# headless training run never renders debug lines anyway.
+try:
+    from omni.isaac.debug_draw import _debug_draw
+except ModuleNotFoundError:
+    _debug_draw = None
+
+
+class _NoopDrawInterface:
+    def clear_lines(self, *args, **kwargs):
+        pass
+
+    def draw_lines(self, *args, **kwargs):
+        pass
+
 
 class DebugDraw:
     def __init__(self):
-        self._draw = _debug_draw.acquire_debug_draw_interface()
+        if _debug_draw is not None:
+            self._draw = _debug_draw.acquire_debug_draw_interface()
+        else:
+            self._draw = _NoopDrawInterface()
 
     def clear(self):
         self._draw.clear_lines()
@@ -88,7 +107,11 @@ class IsaacEnv(EnvBase):
         # store inputs to class
         self.cfg = cfg
         self.enable_render((not headless) or (headless & cfg['enable_livestream']))
-        self.enable_viewport = True
+        # Only bring up the viewport/render stack when we actually need pixels (GUI or
+        # livestream). Under a headless training run there is no window, and loading the
+        # viewport bundle would try to attach a hydra engine to a viewport widget and
+        # segfault. Headless training reads state tensors, not rendered frames.
+        self.enable_viewport = (not headless) or (headless & cfg['enable_livestream'])
         # extract commonly used parameters
         self.num_envs = self.cfg.env.num_envs
         self.max_episode_length = self.cfg.env.max_episode_length
@@ -287,8 +310,14 @@ class IsaacEnv(EnvBase):
         raise NotImplementedError
 
     def _set_seed(self, seed: Optional[int] = -1):
-        import omni.replicator.core as rep
-        rep.set_global_seed(seed)
+        # omni.replicator.core is only brought up on the rendering path (see
+        # _configure_simulation_flags). Under a headless training run it is absent, so
+        # seed it only when available — torch seeding is what matters for training.
+        try:
+            import omni.replicator.core as rep
+            rep.set_global_seed(seed)
+        except ModuleNotFoundError:
+            pass
         torch.manual_seed(seed)
 
     def _configure_simulation_flags(self, sim_params: dict = None):
@@ -326,9 +355,11 @@ class IsaacEnv(EnvBase):
             if self.enable_viewport:
                 # extension for window status bar
                 enable_extension("omni.kit.window.status_bar")
-        # enable isaac replicator extension
-        # note: moved here since it requires to have the viewport extension to be enabled first.
-        enable_extension("omni.replicator.isaac")
+            # enable isaac replicator extension
+            # note: moved here since it requires to have the viewport extension to be
+            # enabled first. Only needed on the rendering path — enabling it headless
+            # transitively spins up a viewport window and segfaults.
+            enable_extension("omni.replicator.isaac")
 
     def to(self, device) -> EnvBase:
         if torch.device(device) != self.device:

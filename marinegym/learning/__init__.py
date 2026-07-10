@@ -24,4 +24,5 @@
 from .ppo import *
 ALGOS = {
     "ppo": PPOPolicy,
+    "ppo_lagrangian": PPOLagrangianPolicy,
 }

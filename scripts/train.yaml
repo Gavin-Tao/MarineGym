@@ -15,6 +15,9 @@ total_frames: 20_000_000
 max_iters: -1
 eval_interval: -1
 save_interval: -1
+load_ckpt: null      # checkpoint to load before training/eval
+eval_only: false     # load_ckpt + deterministic rollout, aggregate keepout metrics, exit
+eval_episodes: 200   # episodes to aggregate in eval_only mode
 seed: 0
 
 viewer:

@@ -22,3 +22,4 @@
 
 
 from .ppo import PPOPolicy
+from .ppo_lagrangian import PPOLagrangianPolicy

@@ -196,3 +196,11 @@ pyrightconfig.json
 
 outputs/
 wandb/
+# core dumps & local artifacts
+core.*
+*.zip
+.claude/
+# unpublished research notes (keep private)
+safe_rl_auv_design.md
+results_summary.md
+ideas_learned_critic_and_residual_rl.md

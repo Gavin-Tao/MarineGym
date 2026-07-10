@@ -25,5 +25,72 @@ reward_effort_weight: 0.1
 reward_action_smoothness_weight: 0.
 reward_motion_smoothness_weight: 0.
 reward_distance_scale: 1.6
+traj_scale_mult: 1.0     # 放大 lemniscate 尺度(keepout 避障实验用 ~2.5,让障碍相对变小、有绕行空间)
 
 action_transform: null
+
+# keep-out obstacle (safe-RL paper; default off, enable with +task.keepout.enable=true)
+keepout:
+  enable: false
+  n_obstacles: 1         # number of keep-out spheres (>=1); B2-OOD set 2-3
+  radius: 0.5            # r_o obstacle radius (m)
+  vehicle_radius: 0.3    # r_v vehicle equivalent radius (m)
+  terminate_on_collision: false
+  spawn_clearance: 0.7   # min clearance from spawn to obstacle surface
+  obstacle_in_obs: true  # true=policy sees obstacle; false=blind
+  reward_weight: 2.0     # avoidance penalty weight
+  reward_margin: 0.5     # penalty band (m) around obstacle surface
+  validate: false        # true=print nominal dynamics validation
+  lateral_offset_std: 0.0  # OOD B3: lateral offset std (m), 0=on trajectory
+  # action inspector (HOCBF shield) -- pure-thruster (T200) vehicles only
+  shield:
+    enable: false
+    alpha1: 2.0
+    alpha2: 2.0
+    drift_bound: 5.0
+    thrust_gain: 40.0
+    activation_margin: 1.0
+  # MPPI predictive safety filter (arm B) -- pure-thruster (T200) vehicles only
+  mppi:
+    enable: false
+    exact: false         # true=use validated <2% NominalDynamics (slow but accurate)
+    horizon: 20
+    num_samples: 128
+    noise_sigma: 0.4
+    temperature: 0.05
+    w_coll: 5.0
+    w_track: 1.0
+    drag: 1.0
+    thrust_gain: 40.0
+    activation_margin: 1.5
+    # risk-proportional soft takeover (needs risk.enable + exact): u = (1-λ)u_rl + λ u_safe,
+    # λ ramps 0→1 as A's predicted clearance falls from soft_hi down to soft_lo (m)
+    soft_blend: false
+    soft_lo: 0.0
+    soft_hi: 0.6
+  # dynamic (moving) obstacle: launched from the side to INTERCEPT the vehicle's future
+  # reference position — reactive avoidance is not enough, prediction is required
+  dynamic:
+    enable: false
+    speed: [0.4, 0.9]        # obstacle speed range (m/s)
+    intercept_steps: [150, 350]  # aim at the reference k steps ahead (k*dt seconds to impact)
+    re_aim_period: 200       # re-launch a fresh intercept every this many steps (sustained pressure)
+  # pure-A-soft ablation: A 的风险λ + 反应式排斥动作(不用 MPPI)
+  field:
+    enable: false
+    gain: 2.0
+  # component A: predictive risk monitor (single exact-model rollout of the policy's action)
+  risk:
+    enable: false
+    horizon: 15          # H-step lookahead
+    threshold: 0.3       # trigger B when predicted min clearance < this (m)
+    risk_norm: 2.0       # risk = clip((risk_norm - min_clear)/risk_norm, 0, 1)
+    in_obs: true         # feed the risk scalar into the policy observation
+  # component C: safety internalization (penalize B's correction so the policy learns it)
+  internalize_weight: 0.0
+  # adaptive C: w_C = internalize_gain * EMA(mean filter engagement) — internalization pressure
+  # tracks recent reliance on B and self-extinguishes; overrides internalize_weight when true
+  internalize_adaptive: false
+  internalize_gain: 5.0
+  internalize_ema: 0.995   # per-step EMA decay of the mean engagement
+  reset_thres: 1.5       # relaxed tracking-error threshold when keepout is on

@@ -44,7 +44,7 @@ from .common import GAE
 @dataclass
 class PPOConfig:
     name: str = "ppo"
-    train_every: int = 32
+    train_every: int = 64
     ppo_epochs: int = 4
     num_minibatches: int = 16
 
@@ -53,6 +53,8 @@ class PPOConfig:
     priv_critic: bool = False
 
     checkpoint_path: Union[str, None] = None
+
+    lr: float = 5e-4
 
 cs = ConfigStore.instance()
 cs.store("ppo", node=PPOConfig, group="algo")
@@ -165,8 +167,8 @@ class PPOPolicy(TensorDictModuleBase):
             self.actor.apply(init_)
             self.critic.apply(init_)
 
-        self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=5e-4)
-        self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=5e-4)
+        self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=cfg.lr)
+        self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=cfg.lr)
         self.value_norm = ValueNorm1(reward_spec.shape[-2:]).to(self.device)
 
     def __call__(self, tensordict: TensorDict):

@@ -244,8 +244,14 @@ class ArticulationView(_ArticulationView):
             return None
 
     def get_world_poses(
-        self, env_indices: Optional[torch.Tensor] = None, clone: bool = True
+        self,
+        env_indices: Optional[torch.Tensor] = None,
+        clone: bool = True,
+        usd: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # `usd` was added to the base ArticulationView.get_world_poses signature in
+        # Isaac Sim 4.1 (XFormPrimView.__init__ calls it as get_world_poses(usd=usd)).
+        # Accept and forward it so this override stays compatible.
         indices = self._resolve_env_indices(env_indices)
         if self._physics_view is not None:
             with disable_warnings(self._physics_sim_view):
@@ -255,7 +261,7 @@ class ArticulationView(_ArticulationView):
                 poses = poses.clone()
             return poses[..., :3], poses[..., [6, 3, 4, 5]]
         else:
-            pos, rot = super().get_world_poses(indices, clone)
+            pos, rot = super().get_world_poses(indices, clone, usd=usd)
             return pos.unflatten(0, self.shape), rot.unflatten(0, self.shape)
 
     def set_world_poses(
@@ -459,10 +465,14 @@ class RigidPrimView(_RigidPrimView):
         return self
 
     def get_world_poses(
-        self, env_indices: Optional[torch.Tensor] = None, clone: bool = True
+        self,
+        env_indices: Optional[torch.Tensor] = None,
+        clone: bool = True,
+        usd: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # See note above: `usd` kwarg added in Isaac Sim 4.1.
         indices = self._resolve_env_indices(env_indices)
-        pos, rot = super().get_world_poses(indices, clone)
+        pos, rot = super().get_world_poses(indices, clone, usd=usd)
         return pos.unflatten(0, self.shape), rot.unflatten(0, self.shape)
 
     def set_world_poses(

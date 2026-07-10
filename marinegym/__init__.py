@@ -22,13 +22,21 @@ def init_simulation_app(cfg):
     "display_options": 3286,  # Set display options to show default grid
 }
     # load cheaper kit config in headless
-    # if cfg.headless:
-    #     app_experience = f"{os.environ['EXP_PATH']}/omni.isaac.sim.python.gym.headless.kit"
-    # else:
-    #     app_experience = f"{os.environ['EXP_PATH']}/omni.isaac.sim.python.kit"
-    app_experience = f"{os.environ['EXP_PATH']}/omni.isaac.sim.python.kit"
+    # NOTE: the full "omni.isaac.sim.python.kit" experience pulls in the viewport/UI
+    # stack, which segfaults inside a headless container (no display) when hydra tries
+    # to attach a viewport texture. Use the gym experiences instead:
+    #   - livestream: gym.livestream.kit (viewport streamed over WebRTC/WebSocket)
+    #   - headless:   gym.headless.kit   (no viewport, cheapest — for training)
+    #   - GUI:        python.kit         (only when a real display is available)
+    exp_path = os.environ["EXP_PATH"]
+    if cfg["enable_livestream"]:
+        app_experience = f"{exp_path}/omni.isaac.sim.python.gym.livestream.kit"
+    elif cfg["headless"]:
+        app_experience = f"{exp_path}/omni.isaac.sim.python.gym.headless.kit"
+    else:
+        app_experience = f"{exp_path}/omni.isaac.sim.python.kit"
     simulation_app = SimulationApp(config, experience=app_experience)
-    
+
     if config['enable_livestream']:
         from omni.isaac.core.utils.extensions import enable_extension
         simulation_app.set_setting("/app/window/drawMouse", True)

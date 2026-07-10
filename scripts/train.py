@@ -32,6 +32,25 @@ from setproctitle import setproctitle
 from torchrl.envs.transforms import TransformedEnv, InitTracker, Compose
 
 
+def compute_avg_power(actions: torch.Tensor) -> float:
+    """Compute mean electrical power (W) across all steps/envs/rotors from action tensor."""
+    throttle = actions  # T200: signed throttle in [-1, 1]
+    rpm = torch.where(
+        throttle > 0.075,  3.6599e3 * throttle + 3.4521e2,
+        torch.where(throttle < -0.075, 3.4944e3 * throttle - 4.3350e2,
+            torch.zeros_like(throttle))
+    ).clamp(-3900, 3900)
+    thrust = (9.81 * torch.where(
+        rpm > 0,
+        4.7368e-7 * rpm.pow(2) - 1.9275e-4 * rpm + 8.4452e-2,
+        -3.8442e-7 * rpm.pow(2) - 1.6186e-4 * rpm - 3.9139e-2,
+    )).clamp(-40.22, 51.50)  # clamp in N (after ×9.81), matching policy _compute_power_cost
+    power_fwd = 0.758 * thrust.abs().pow(1.574)
+    power_rev = 0.851 * thrust.abs().pow(1.654)
+    power = torch.where(thrust >= 0, power_fwd, power_rev)
+    return power.sum(-1).mean().item()  # sum over rotors, mean over steps/envs
+
+
 @hydra.main(version_base=None, config_path=".", config_name="train")
 def main(cfg):
     OmegaConf.register_new_resolver("eval", eval)
@@ -75,6 +94,10 @@ def main(cfg):
     env = TransformedEnv(base_env, Compose(*transforms)).train()
     env.set_seed(cfg.seed)
 
+    # Inject drone model name for actuator-aware power cost computation
+    if hasattr(cfg.algo, "drone_model_name"):
+        cfg.algo.drone_model_name = cfg.task.drone_model.name
+
     try:
         policy = ALGOS[cfg.algo.name.lower()](
             cfg.algo,
@@ -85,6 +108,13 @@ def main(cfg):
         )
     except KeyError:
         raise NotImplementedError(f"Unknown algorithm: {cfg.algo.name}")
+
+    # Optional: load a pre-trained checkpoint for eval-only mode
+    load_ckpt = cfg.get("load_ckpt", None)
+    if load_ckpt:
+        ckpt = torch.load(load_ckpt, map_location=base_env.device)
+        policy.load_state_dict(ckpt)
+        logging.info(f"Loaded checkpoint from {load_ckpt}")
 
     frames_per_batch = env.num_envs * int(cfg.algo.train_every)
     total_frames = cfg.get("total_frames", -1) // frames_per_batch * frames_per_batch
@@ -112,12 +142,13 @@ def main(cfg):
         exploration_type: ExplorationType=ExplorationType.MODE
     ):
 
-        base_env.enable_render(True)
+        if not cfg.headless:
+            base_env.enable_render(True)
         base_env.eval()
         env.eval()
         env.set_seed(seed)
 
-        render_callback = RenderCallback(interval=2)
+        render_callback = RenderCallback(interval=2) if not cfg.headless else None
 
         with set_exploration_type(exploration_type):
             trajs = env.rollout(
@@ -148,12 +179,16 @@ def main(cfg):
             for k, v in traj_stats.items()
         }
 
-        # log video
-        info["recording"] = wandb.Video(
-            render_callback.get_video_array(axes="t c h w"),
-            fps=0.5 / (cfg.sim.dt * cfg.sim.substeps),
-            format="mp4"
-        )
+        actions = trajs.get(("agents", "action"))
+        info["eval/avg_power_W"] = compute_avg_power(actions.cpu())
+
+        # log video (only when rendering is available)
+        if render_callback is not None:
+            info["recording"] = wandb.Video(
+                render_callback.get_video_array(axes="t c h w"),
+                fps=0.5 / (cfg.sim.dt * cfg.sim.substeps),
+                format="mp4"
+            )
 
         # log distributions
         # df = pd.DataFrame(traj_stats)
@@ -162,6 +197,30 @@ def main(cfg):
         # info["eval/episode_len"] = wandb.plot.histogram(table, "episode_len")
 
         return info
+
+    # eval-only: load a checkpoint, roll out the deterministic policy under the current (e.g. OOD) config,
+    # aggregate keep-out metrics, print, and exit — no training. (filter on/off is just a keepout.* config)
+    if cfg.get("eval_only", False):
+        logging.info("EVAL-ONLY: rolling out loaded policy (no training)...")
+        base_env.eval(); env.eval()
+        n_eval_ep = int(cfg.get("eval_episodes", 200))
+        max_batches = int(cfg.get("eval_max_batches", 45))   # wall-clock guard (episodes can be long)
+        with set_exploration_type(ExplorationType.MODE):
+            for bi, data in enumerate(collector):
+                episode_stats.add(data.to_tensordict())
+                if bi % 5 == 0:
+                    print(f"[eval] batch {bi} episodes {episode_stats._episodes}", flush=True)
+                if episode_stats._episodes >= n_eval_ep or bi >= max_batches:
+                    break
+        stats = episode_stats.pop()
+        agg = {(".".join(k) if isinstance(k, tuple) else k): v.float().mean().item()
+               for k, v in stats.items(True, True)}
+        print(f"=== EVAL-ONLY RESULTS (episodes={episode_stats._episodes}) ===", flush=True)
+        for k in sorted(agg):
+            print(f"  {k}: {agg[k]:.4f}", flush=True)
+        wandb.finish()
+        simulation_app.close()
+        return
 
     pbar = tqdm(collector, total=total_frames//frames_per_batch)
     env.train()
@@ -177,6 +236,10 @@ def main(cfg):
             info.update(stats)
 
         info.update(policy.train_op(data.to_tensordict()))
+
+        train_actions = data.get(("agents", "action"))
+        if train_actions is not None:
+            info["train/stats.avg_power_W"] = compute_avg_power(train_actions.cpu())
 
         if eval_interval > 0 and i % eval_interval == 0:
             logging.info(f"Eval at {collector._frames} steps.")
