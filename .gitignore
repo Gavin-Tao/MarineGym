@@ -200,7 +200,4 @@ wandb/
 core.*
 *.zip
 .claude/
-# unpublished research notes (keep private)
-safe_rl_auv_design.md
-results_summary.md
-ideas_learned_critic_and_residual_rl.md
+# research notes — now public for handoff
