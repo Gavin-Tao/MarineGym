@@ -464,6 +464,14 @@ class Track(IsaacEnv):
                          / (self.mppi_soft_hi - self.mppi_soft_lo)).clamp(0.0, 1.0)
                 trigger = blend > 0
                 self._risk_trigger = trigger
+            elif self.mppi_enable:
+                # geometric-gate hard ablation: binary trigger from CURRENT clearance,
+                # using the same 0.6 m boundary as the soft ramp so the 2x2 differs only
+                # in step-vs-ramp, not in where the boundary sits.
+                clearance_now = ((self.drone_state[..., :3].reshape(-1, 3) - closest).norm(dim=-1, keepdim=True)
+                                 - (self.keepout_radius + self.vehicle_radius))
+                trigger = clearance_now < self.mppi_soft_hi
+                self._risk_trigger = trigger
             # protection chain — policy → (shield) → field OR MPPI
             if self.shield_enable:
                 actions = self.shield.filter(self.drone_state, closest, actions)

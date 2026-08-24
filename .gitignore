@@ -201,3 +201,9 @@ core.*
 *.zip
 .claude/
 # research notes — now public for handoff
+
+# AEI 实验：日志不入库，只保留汇总数据与图
+*.bak
+scripts/outputs_aei/*
+!scripts/outputs_aei/data/
+!scripts/outputs_aei/figures/
