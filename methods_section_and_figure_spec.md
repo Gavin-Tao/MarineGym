@@ -149,12 +149,27 @@ $$u_t = (1-\lambda_t)\,u^{\mathrm{rl}}_t + \lambda_t\, u^{\mathrm{safe}}_t .$$
 | **Shared** | $(h_{\mathrm{lo}}, h_{\mathrm{hi}})$ | $(0,1)$ | authority transferred in proportion to predicted risk |
 | **Protective** | $\le h_{\mathrm{lo}}$ | $1$ | filter fully in command |
 
-Because $\lambda_t = 0$ implies the MPPI stage is skipped, the expected computational overhead is $\mathbb E[\lambda > 0]$ times the filter cost; the measured engagement rate of the converged policy is $\approx 0.10$.
+Because $\lambda_t = 0$ implies the MPPI stage is skipped, the expected computational overhead is $\mathbb E[\lambda > 0]$ times the filter cost; the measured engagement rate of the converged policy is $\approx 0.018$ on the ood scene (mean $\lambda$ over evaluation steps; $\approx 0.046$ during training, where exploration noise makes the proposal riskier).
 
 **Why proportional rather than binary.** We identify three effects:
 
 * **(i) Continuity of the applied command.** A binary shield switches between $u^{\mathrm{rl}}$ and $u^{\mathrm{safe}}$ discontinuously and chatters near the threshold, exciting thrust reversals. $\lambda_t$ is Lipschitz in $\hat d_t$, hence $u_t$ is continuous.
-* **(ii) Mildness of the induced off-policy shift (learning-side effect).** During training the *executed* command is the one recorded in the rollout, so the policy gradient is evaluated at $u_t$ while the behaviour log-probability was recorded at $u^{\mathrm{rl}}_t$. The resulting importance ratio deviates from unity by an amount proportional to $\lVert u_t - u^{\mathrm{rl}}_t \rVert = \lambda_t \lVert u^{\mathrm{safe}}_t - u^{\mathrm{rl}}_t\rVert$. A proportional blend keeps this deviation small and graded; a binary switch injects a full-magnitude jump whenever it fires. This predicts that proportional takeover should dominate binary takeover *under every other configuration*, which is what the ablation matrix shows.
+* **(ii) Mildness of the induced off-policy shift (learning-side effect).** During training the *executed*
+  command is what the rollout records, while the behaviour log-probability was recorded at the *proposal*
+  $u^{\mathrm{rl}}_t$. A proportional blend keeps the induced discrepancy small and graded
+  ($\lVert u_t - u^{\mathrm{rl}}_t \rVert = \lambda_t \lVert u^{\mathrm{safe}}_t - u^{\mathrm{rl}}_t\rVert$);
+  a binary switch injects a full-magnitude jump whenever it fires.
+
+  > **⚠️ Implementation note (must be resolved before submission).** In the current code this discrepancy is
+  > not a designed property but a **mis-specified importance ratio**: `ppo.py` evaluates
+  > $\log \pi_\theta(u_t\mid s)$ against a stored $\log \pi_{\mathrm{old}}(u^{\mathrm{rl}}\mid s)$, i.e. the
+  > numerator and denominator refer to *different actions*. The correct treatment is to absorb the
+  > (deterministic, $\theta$-independent) filter into the transition kernel and store $u^{\mathrm{rl}}$ for the
+  > learner, since $\nabla \log p_\theta(\tau) = \sum_t \nabla \log \pi_\theta(u^{\mathrm{rl}}_t \mid s_t)$.
+  > Because the induced distortion grows monotonically along the takeover axis (none $\rightarrow$ proportional
+  > $\rightarrow$ binary), **the observed proportional-vs-binary differences currently confound the deployment
+  > effect with a training-objective artefact** and must be re-measured after the fix.
+
 * **(iii) Unimodality of the executed action distribution.** The executed action remains a smooth deformation of the policy's own distribution rather than a mixture of two disjoint modes.
 
 ---
@@ -165,9 +180,9 @@ Because $\lambda_t = 0$ implies the MPPI stage is skipped, the expected computat
 
 The policy is trained with **unmodified PPO** on the scalar reward of Sec. II-D: no cost critic, no Lagrange multiplier, no constraint-satisfaction machinery, and — importantly — **no penalty on the filter's correction**. The safety filter is present *during training as well as deployment*, so that (a) exploration is protected from the first iteration and (b) there is no train–deploy distribution shift in the action channel.
 
-We explicitly evaluated the natural alternative of *internalising* safety by penalising the filter's intervention,
-$$r_t \leftarrow r_t - w_C \lVert u^{\mathrm{safe}}_t - u^{\mathrm{rl}}_t \rVert^2,$$
-in both a fixed-weight and a self-extinguishing adaptive form ($w_C = \kappa\,\mathrm{EMA}[\lambda]$). Both **degrade** safety monotonically with their complexity (Sec. Experiments); we therefore report internalisation as a negative result and exclude it from the final method.
+The correction penalty $r_t \leftarrow r_t - w_C \lVert u^{\mathrm{safe}}_t - u^{\mathrm{rl}}_t \rVert^2$
+(a standard companion to shielding, which discourages the policy from relying on the filter) is **not part of
+this method** and is disabled throughout: `internalize_weight = 0`, `internalize_adaptive = false`.
 
 ---
 
@@ -182,7 +197,17 @@ The architecture exposes two orthogonal design axes — **the gating signal** an
 | **Geometric gate** (current distance $d_t$) | distance-triggered MPPI | $\lambda$ from $d_t$ |
 | **Predictive gate** (predicted $\hat d_t$, Component A) | risk-triggered MPPI | **RP-PSF (ours)** |
 
-Additional reference points: a single-step HOCBF action shield (reactive projection), and PPO with the avoidance reward but no filter.
+All four cells share **one frozen hyper-parameter set** (`scripts/aei_fixed_params.sh`): the same gate
+boundary $h_{\mathrm{hi}} = 0.6\,\mathrm{m}$ — used both as the ramp upper limit for proportional takeover and
+as the trigger threshold for binary takeover — the same $K, N, H$, the same scene, the same training budget and
+seed. Crucially, all four also share the **same observation space (45-d, including the risk scalar)**: the
+geometric-gate cells set `risk.gate = false`, which reverts the *gating signal* to the current clearance while
+the risk monitor keeps running and feeding the observation. Each cell therefore differs from ours by exactly
+one switch.
+
+Additional reference points: **A-only** (risk monitor on, MPPI disabled — isolates the observation channel from
+the filtering action), a single-step HOCBF action shield (reactive projection), and PPO with the avoidance
+reward but no filter.
 
 ---
 
