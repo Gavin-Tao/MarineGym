@@ -200,6 +200,59 @@ def main(cfg):
 
     # eval-only: load a checkpoint, roll out the deterministic policy under the current (e.g. OOD) config,
     # aggregate keep-out metrics, print, and exit — no training. (filter on/off is just a keepout.* config)
+    # ---- 轨迹采集（仅在显式指定 +save_traj=<path.npz> 时启用，不影响既有流程）----
+    if cfg.get("save_traj", None):
+        from torchrl.envs.utils import step_mdp
+        logging.info("CAPTURE-TRAJ: rolling out and recording positions...")
+        base_env.eval(); env.eval()
+        n_steps = int(cfg.get("traj_steps", 240))
+        rec = {k: [] for k in ("pos", "ref", "obst", "quat", "vel", "engage", "clearance",
+                               "u_rl", "u_applied", "done")}
+        td = env.reset()
+        be = base_env
+        # 完整参考轨迹（整条 lemniscate，从 reset 时刻起算 max_episode_length 步）
+        # —— 用于在轨迹图上显示载具在整条路径上走到了哪
+        try:
+            full_ref = be._compute_traj(be.max_episode_length, step_size=1.0).cpu().numpy()
+        except Exception as ex:
+            logging.warning(f"full_ref 采集失败: {ex}")
+            full_ref = None
+        with set_exploration_type(ExplorationType.MODE), torch.no_grad():
+            const_a = cfg.get("const_action", None)
+            for _ in range(n_steps):
+                td = policy(td)
+                if const_a is not None:      # 诊断：用固定动作覆盖策略，测载具真实能力
+                    td.set(("agents", "action"),
+                           torch.full_like(td[("agents", "action")], float(const_a)))
+                td = env.step(td)
+                rec["pos"].append(be.drone_state[..., :3].reshape(-1, 3).cpu().numpy().copy())
+                rec["ref"].append(be.target_pos[:, 0].reshape(-1, 3).cpu().numpy().copy())
+                _ob = getattr(be, "obstacle_pos", None)
+                rec["obst"].append(_ob.reshape(be.num_envs, -1, 3).cpu().numpy().copy()
+                                   if _ob is not None else np.zeros((be.num_envs, 1, 3), dtype=np.float32))
+                # drone_state = [pos(3), quat(4), vel(6), heading(3), up(3), throttle(6)]
+                rec["quat"].append(be.drone_state[..., 3:7].reshape(-1, 4).cpu().numpy().copy())
+                rec["vel"].append(be.drone_state[..., 7:13].reshape(-1, 6).cpu().numpy().copy())
+                eng = getattr(be, "_filter_engage", None)
+                rec["engage"].append(eng.reshape(-1).float().cpu().numpy().copy()
+                                     if eng is not None else np.zeros(be.num_envs, dtype=np.float32))
+                for key, attr in (("u_rl", "_u_rl"), ("u_applied", "_u_applied")):
+                    v = getattr(be, attr, None)
+                    rec[key].append(v.reshape(be.num_envs, -1).cpu().numpy().copy()
+                                    if v is not None else np.zeros((be.num_envs, 6), dtype=np.float32))
+                cl = getattr(be, "_clearance", None)
+                rec["clearance"].append(cl.reshape(-1).cpu().numpy().copy()
+                                        if cl is not None else np.full(be.num_envs, np.nan, dtype=np.float32))
+                rec["done"].append(td["next", "done"].reshape(-1).cpu().numpy().copy())
+                td = step_mdp(td)
+        out = {k: np.asarray(v) for k, v in rec.items()}
+        if full_ref is not None: out["full_ref"] = full_ref
+        out["keepout_r"] = np.asarray([float(getattr(be, "keepout_radius", 0.0))
+                                       + float(getattr(be, "vehicle_radius", 0.0))])
+        np.savez_compressed(cfg.save_traj, **out)
+        logging.info(f"CAPTURE-TRAJ: saved {out['pos'].shape} to {cfg.save_traj}")
+        wandb.finish(); simulation_app.close(); return
+
     if cfg.get("eval_only", False):
         logging.info("EVAL-ONLY: rolling out loaded policy (no training)...")
         base_env.eval(); env.eval()

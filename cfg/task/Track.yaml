@@ -26,6 +26,8 @@ reward_action_smoothness_weight: 0.
 reward_motion_smoothness_weight: 0.
 reward_distance_scale: 1.6
 traj_scale_mult: 1.0     # 放大 lemniscate 尺度(keepout 避障实验用 ~2.5,让障碍相对变小、有绕行空间)
+traj_w_range: [0.7, 0.9] # 轨迹角速度区间；参考线速度 ∝ traj_scale × traj_w。
+                         # 放大 traj_scale_mult 时须按比例调小本项，否则参考速度会超出载具能力
 
 action_transform: null
 

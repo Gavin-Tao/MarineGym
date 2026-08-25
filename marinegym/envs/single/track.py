@@ -148,9 +148,13 @@ class Track(IsaacEnv):
             torch.tensor([1.4, 1.4, 0.8], device=self.device) * _tsm,
             torch.tensor([2.6, 2.6, 1.2], device=self.device) * _tsm
         )
+        # 轨迹角速度：参考点线速度 ∝ traj_scale × traj_w。
+        # 单独放大 traj_scale_mult 会同比例放大参考速度，可能超出载具能力使任务不可跟踪；
+        # 需要"大工作空间 + 可跟踪速度"时，按比例调小本区间即可。
+        _tw = cfg.task.get("traj_w_range", [0.7, 0.9])
         self.traj_w_dist = D.Uniform(
-            torch.tensor(0.7, device=self.device),
-            torch.tensor(0.9, device=self.device)
+            torch.tensor(float(_tw[0]), device=self.device),
+            torch.tensor(float(_tw[1]), device=self.device)
         )
         self.origin = torch.tensor([0., 0., 2.], device=self.device)
 
@@ -516,6 +520,9 @@ class Track(IsaacEnv):
                 self._filter_engage = trigger.float()
             # C: record the correction the filter applied (internalization penalty + stats)
             self._correction = ((actions - u_rl) ** 2).sum(-1)               # [E,1]
+            # 供轨迹采集：滤波前(策略提议)与滤波后(实际执行)的动作对
+            self._u_rl = u_rl.detach().clone()
+            self._u_applied = actions.detach().clone()
             tensordict.set(("agents", "action"), actions)  # downstream logging/metrics see u_safe
         if self.validate_dynamics or self.validate_full:  # record pre-step state + applied action
             self._val_vb = self.drone.vel_b.clone()
