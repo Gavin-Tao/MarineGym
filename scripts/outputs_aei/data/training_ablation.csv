@@ -1,0 +1,9 @@
+variant,cum_violation
+Predictive + binary,0.0555555559694767
+Geometric + prop.,0.1180555559694767
+RP-PSF (pred.+prop.),0.1587301604449749
+A-only,0.1656746044754982
++ fixed C,0.2178976871073246
+Geometric + binary,0.2292780764400959
++ adaptive C,0.30882352963089943
+T1 PPO baseline,0.39985380321741104

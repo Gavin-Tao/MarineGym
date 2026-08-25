@@ -54,6 +54,7 @@ class Track(IsaacEnv):
             self.mppi_cfg = keepout_cfg.get("mppi", None)
             self.mppi_enable = bool(self.mppi_cfg is not None and self.mppi_cfg.get("enable", False))
             self.validate_dynamics = bool(keepout_cfg.get("validate", False))
+            self.validate_full = bool(keepout_cfg.get("validate_full", False))
             # OOD placement: lateral offset std (m), 0 = on reference trajectory
             self.lateral_offset_std = float(keepout_cfg.get("lateral_offset_std", 0.0))
             # dynamic (moving, intercepting) obstacle
@@ -87,6 +88,7 @@ class Track(IsaacEnv):
             self.shield_enable = False
             self.mppi_enable = False
             self.validate_dynamics = False
+            self.validate_full = False
             self.n_obstacles = 1
             self.lateral_offset_std = 0.0
             self.risk_enable = False
@@ -236,6 +238,14 @@ class Track(IsaacEnv):
         if self.validate_dynamics:
             from marinegym.utils.nominal_dynamics import NominalDynamics
             self.nominal = NominalDynamics(self.drone, self.dt * int(self.cfg.sim.get("substeps", 1)))
+            # C3: 给名义模型注入参数误差（仅影响 f_nom，不动仿真器真值）
+            _ms = float(keepout_cfg.get("nom_scale_mass", 1.0))
+            _ds = float(keepout_cfg.get("nom_scale_drag", 1.0))
+            _ts = float(keepout_cfg.get("nom_scale_thrust", 1.0))
+            for _nd_ in {id(x): x for x in (self.nominal, getattr(self, "_nd", None)) if x is not None}.values():
+                if _ms != 1.0: _nd_.M_rb = _nd_.M_rb * _ms
+                if _ds != 1.0: _nd_.Dl = _nd_.Dl * _ds; _nd_.Dq = _nd_.Dq * _ds
+                if _ts != 1.0: _nd_.fc_scale = _nd_.fc_scale * _ts
             self._val_count = 0
 
         self.alpha = 0.8
@@ -496,7 +506,7 @@ class Track(IsaacEnv):
             # C: record the correction the filter applied (internalization penalty + stats)
             self._correction = ((actions - u_rl) ** 2).sum(-1)               # [E,1]
             tensordict.set(("agents", "action"), actions)  # downstream logging/metrics see u_safe
-        if self.validate_dynamics:  # record pre-step state + applied action for one-step dynamics validation
+        if self.validate_dynamics or self.validate_full:  # record pre-step state + applied action
             self._val_vb = self.drone.vel_b.clone()
             self._val_q = self.drone.rot.clone()
             self._val_a = actions.clone()
@@ -513,9 +523,34 @@ class Track(IsaacEnv):
             wind_forces = wind_forces.unsqueeze(1).expand(*self.drone.shape, 3)
             self.drone.base_link.apply_forces(wind_forces, is_global=True)
 
+    def _nom_onestep(self):
+        """N1: 名义模型单步机体速度相对误差 —— 完整模型 + 两项消融。"""
+        import copy, json, statistics
+        nd = self.nominal
+        if not hasattr(self, "_nom_var"):
+            a = copy.copy(nd); a.tau = 1.0; a.time_const = nd.time_const * 0 + 1e-9  # 去 T200 迟滞
+            b = copy.copy(nd); b.M_rb = nd.M_rb + nd.M_A.abs()                       # 附加质量并入 M
+            self._nom_var = {"full": nd, "no_t200_lag": a, "added_mass_in_M": b}
+            self._nom_err = {k: [] for k in self._nom_var}
+        st = dict(pos=self.drone_state[..., :3], quat=self._val_q, vel_b=self._val_vb,
+                  v_prev=self._val_vprev, acc_prev=self._val_aprev,
+                  throttle=self._val_thr, rpm=self._val_rpm)
+        va = self.drone.vel_b
+        for name, m in self._nom_var.items():
+            pred = m.step({k: v.clone() for k, v in st.items()}, self._val_a)["vel_b"]
+            self._nom_err[name].append(
+                ((pred - va).norm(dim=-1) / (va.norm(dim=-1) + 1e-3)).median().item())
+        if len(self._nom_err["full"]) % 200 == 0:
+            out = {k: dict(mean=statistics.mean(v), median=statistics.median(v), n=len(v))
+                   for k, v in self._nom_err.items()}
+            with open("/home/jovyan/MarineGym/scripts/outputs_aei/data/nominal_onestep.json", "w") as f:
+                json.dump(out, f, indent=2)
+
     def _compute_state_and_obs(self):
         self.drone_state = self.drone.get_state()
 
+        if self.validate_full and hasattr(self, "_val_vb"):
+            self._nom_onestep()
         if self.validate_dynamics and hasattr(self, "_val_vb") and self._val_count < 8:
             from marinegym.utils.torch import quat_rotate_inverse, quaternion_to_euler
             nd = self.nominal
