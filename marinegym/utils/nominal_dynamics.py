@@ -94,8 +94,12 @@ class NominalDynamics:
         return hydro + buoy, v, acc
 
     @torch.no_grad()
-    def step(self, s, action):
-        """s = dict(pos, quat, vel_b, v_prev, acc_prev, throttle, rpm) [v_prev/acc_prev in flipped frame]."""
+    def step(self, s, action, d_hat=None):
+        """s = dict(pos, quat, vel_b, v_prev, acc_prev, throttle, rpm) [v_prev/acc_prev in flipped frame].
+
+        d_hat [...,6] (论文②): 体系等效广义外力残差，加到 wrench 上。用来把在线估到的
+        未建模水动力（洋流）带进前滚 —— offset-free MPC 的标准做法，前滚期间零阶保持。
+        """
         pos, quat, vel_b = s["pos"], s["quat"], s["vel_b"]
         throttle, rpm, thrust = self.t200_step(s["throttle"], s["rpm"], action)
         F_thr = torch.einsum('...r,rd->...d', thrust, self.Blin)
@@ -105,6 +109,8 @@ class NominalDynamics:
         g_w = torch.zeros_like(pos); g_w[..., 2] = -self.weight
         g_b = quat_rotate_inverse(quat.reshape(-1, 4), g_w.reshape(-1, 3)).reshape_as(pos)
         wrench = torch.cat([F_thr + hydro[..., 0:3] + g_b, T_thr + hydro[..., 3:6]], dim=-1)
+        if d_hat is not None:
+            wrench = wrench + d_hat
         nu_dot = wrench / self.M_rb
         v_new = vel_b + self.dt * nu_dot
         v_w = quat_rotate(quat.reshape(-1, 4), v_new[..., 0:3].reshape(-1, 3)).reshape_as(pos)

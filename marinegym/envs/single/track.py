@@ -111,6 +111,74 @@ class Track(IsaacEnv):
             self.field_enable = False
             self.dyn_enable = False
 
+        # ── 论文② (flow-safety)：keep-in 走廊 + 阵风。与 keepout 完全独立，默认全关 ──
+        # 走廊是**世界系**的（海沟侧壁），不是以参考点为中心的管道：
+        # 若以参考点为中心，clearance = R − ‖p − p_ref‖ 就是跟踪误差的单调函数，
+        # 门控信号与奖励主项是同一个量（正是"拿 tracking error 当 risk"被否决的理由）。
+        # 世界系走廊让"贴壁裕度"与"跟踪误差"成为两个不同的量。
+        cor_cfg = cfg.task.get("corridor", None)
+        self.corridor_enable = bool(cor_cfg is not None and cor_cfg.get("enable", False))
+        if self.corridor_enable:
+            self.cor_axis = int(cor_cfg.get("axis", 1))              # 0=x 1=y 2=z，受限轴
+            self.cor_margin = float(cor_cfg.get("margin", 0.35))     # 半宽 = max|ref_axis| + margin
+            _hw = cor_cfg.get("half_width", None)
+            self.cor_half_width_abs = float(_hw) if _hw is not None else None
+            self.cor_vehicle_radius = float(cor_cfg.get("vehicle_radius", 0.3))
+            self.cor_reward_weight = float(cor_cfg.get("reward_weight", 2.0))
+            self.cor_reward_margin = float(cor_cfg.get("reward_margin", 0.3))
+            self.cor_in_obs = bool(cor_cfg.get("in_obs", True))
+            self.cor_terminate = bool(cor_cfg.get("terminate_on_violation", False))
+            self.cor_freeze_yaw = bool(cor_cfg.get("freeze_traj_yaw", True))
+            # 违约不终止 → 各方法曝光量相同、违约率可比（沿用论文①禁区非碰撞体的口径）。
+            # 因此必须放宽跟踪误差终止，否则一飘出去就 reset，曝光不等。
+            self.reset_thres = float(cor_cfg.get("reset_thres", max(self.reset_thres, 3.0)))
+        else:
+            self.cor_in_obs = False
+            self.cor_freeze_yaw = False
+
+        gust_cfg = cfg.task.get("gust", None)
+        self.gust_enable = bool(gust_cfg is not None and gust_cfg.get("enable", False))
+        if self.gust_enable:
+            self.gust_speed = list(gust_cfg.get("speed", [0.6, 1.0]))
+            self.gust_ramp = list(gust_cfg.get("ramp", [0.2, 0.5]))     # 上升时间 (s)
+            self.gust_hold = list(gust_cfg.get("hold", [1.0, 2.0]))     # 保持时间 (s)
+            self.gust_period = int(gust_cfg.get("period", 200))          # 重发周期 (步)
+            self.gust_axis = int(gust_cfg.get("axis", 1))
+            self.gust_aim = str(gust_cfg.get("aim", "curvature"))
+            self.gust_lookahead = list(gust_cfg.get("lookahead", [60, 200]))
+
+        # 安全栈 A→λ→B（走廊版）。只有 corridor 开着才有意义。
+        saf = cfg.task.get("safety", None)
+        _s = (saf if saf is not None else {})
+        _dob = _s.get("dobs", {}) or {}
+        _rsk = _s.get("risk", {}) or {}
+        _mpp = _s.get("mppi", {}) or {}
+        self.dobs_enable = bool(self.corridor_enable and _dob.get("enable", True))
+        self.dobs_alpha = float(_dob.get("alpha", 0.1))
+        self.dobs_clip = float(_dob.get("clip", 200.0))
+        self.dobs_oracle = bool(_dob.get("oracle", False))
+        self.dobs_zero = bool(_dob.get("zero", False))
+        self.cor_risk_enable = bool(self.corridor_enable and _rsk.get("enable", False))
+        self.cor_risk_H = int(_rsk.get("horizon", 15))
+        self.cor_risk_thr = float(_rsk.get("threshold", 0.6))
+        self.cor_risk_gate = bool(_rsk.get("gate", True))
+        self.cor_risk_norm = float(_rsk.get("risk_norm", 2.0))
+        self.cor_risk_in_obs = bool(self.cor_risk_enable and _rsk.get("in_obs", True))
+        self.cor_mppi_enable = bool(self.corridor_enable and _mpp.get("enable", False))
+        self.cor_mppi_soft = bool(_mpp.get("soft", True))
+        self.cor_mppi_lo = float(_mpp.get("soft_lo", 0.0))
+        self.cor_gate_boundary = float(_mpp.get("soft_hi", 0.6))
+        self.cor_mppi_w_ref = float(_mpp.get("w_ref", 0.0))
+        _fl = _mpp.get("force_lambda", None)
+        self.cor_force_lambda = float(_fl) if _fl is not None else None   # MPC-only 基线设 1.0
+        self.cor_mppi_cfg = _mpp
+        self.k4_enable = bool(_s.get("k4", False))   # K4 诊断：同时算 d̂=0 / est / oracle 三种预测
+        # 流速观测必须**独立于 gust.enable**：否则 calm 场景(关阵风)的观测维度比训练时少 1，
+        # 同一条 checkpoint 加载直接 shape mismatch，"一条策略跑遍所有场景"的设计就废了。
+        # 无阵风时这一维恒为 0，不影响策略。
+        self.flow_in_obs = bool(self.corridor_enable and _s.get("flow_in_obs", True))
+        self.flow_obs_axis = self.gust_axis if self.gust_enable else int(getattr(self, "cor_axis", 1))
+
         super().__init__(cfg, headless)
 
         self.drone.initialize()
@@ -135,9 +203,12 @@ class Track(IsaacEnv):
             torch.tensor([-.2, -.2, 0.], device=self.device) * torch.pi,
             torch.tensor([0.2, 0.2, 2.], device=self.device) * torch.pi
         )
+        # 默认 yaw 在 [0,2π) 随机 → 轨迹整体绕 z 轴随机转向。世界系走廊(侧壁)要求轨迹
+        # 朝向固定，否则"侧壁"相对轨迹的位置每个 episode 都不同，难度不可控。
+        _yaw_hi = 0. if self.cor_freeze_yaw else 2.
         self.traj_rpy_dist = D.Uniform(
             torch.tensor([0., 0., 0.], device=self.device) * torch.pi,
-            torch.tensor([0., 0., 2.], device=self.device) * torch.pi
+            torch.tensor([0., 0., _yaw_hi], device=self.device) * torch.pi
         )
         self.traj_c_dist = D.Uniform(
             torch.tensor(-0.6, device=self.device),
@@ -252,6 +323,45 @@ class Track(IsaacEnv):
             self._filter_engage = torch.zeros(self.num_envs, 1, device=self.device)    # λ (soft) or 0/1 trigger
             self._engage_ema = torch.zeros((), device=self.device)                     # adaptive C: mean engagement EMA
             self._wC = torch.zeros((), device=self.device)                             # adaptive C: current weight
+        if self.corridor_enable:
+            E = self.num_envs
+            self._cor_hw = torch.zeros(E, 1, device=self.device)          # 该 episode 的走廊半宽
+            self._cor_clear = torch.zeros(E, 1, device=self.device)       # 到最近侧壁的裕度
+            self._cor_violate = torch.zeros(E, 1, dtype=torch.bool, device=self.device)
+        if self.gust_enable:
+            E = self.num_envs
+            self._gust_t0 = torch.zeros(E, 1, device=self.device)         # 起风步
+            self._gust_amp = torch.zeros(E, 1, device=self.device)        # 幅值 (m/s)，带符号
+            self._gust_ramp = torch.ones(E, 1, device=self.device)        # 上升步数
+            self._gust_hold = torch.ones(E, 1, device=self.device)        # 保持步数
+            self._gust_next = torch.zeros(E, 1, device=self.device)       # 下次重发的步（独立计时）
+        if self.corridor_enable and (self.dobs_enable or self.cor_risk_enable or self.cor_mppi_enable):
+            from marinegym.utils.nominal_dynamics import NominalDynamics
+            _dt = self.dt * int(self.cfg.sim.get("substeps", 1))
+            self._cnd = NominalDynamics(self.drone, _dt)
+            E = self.num_envs
+            self._d_hat = torch.zeros(E, 1, 6, device=self.device)
+            self._cor_risk = torch.zeros(E, 1, 1, device=self.device)      # 进观测的 risk 标量（延迟一步）
+            self._cor_lam = torch.zeros(E, 1, device=self.device)          # λ 接管系数
+            self._cor_u_rl = None
+            self._cor_corr = torch.zeros(E, 1, device=self.device)         # ‖u_safe − u_rl‖²
+            self._cor_prev = None                                          # 上一步(物理步前)的状态
+            self._cor_prev_a = None
+            if self.dobs_enable:
+                from marinegym.utils.disturbance_observer import DisturbanceObserver
+                self._dobs = DisturbanceObserver(self._cnd, alpha=self.dobs_alpha, clip=self.dobs_clip)
+            if self.cor_risk_enable:
+                from marinegym.utils.risk_monitor import RiskMonitor
+                self._cor_rm = RiskMonitor(self.drone, self._cnd, 0.0, 0.0, horizon=self.cor_risk_H,
+                                           threshold=self.cor_risk_thr, risk_norm=self.cor_risk_norm)
+            if self.cor_mppi_enable:
+                from marinegym.utils.mppi_filter import MPPIExactShield
+                m = self.cor_mppi_cfg
+                self._cor_mppi = MPPIExactShield(
+                    self.drone, self._cnd, 0.0, 0.0,
+                    horizon=int(m.get("horizon", 20)), num_samples=int(m.get("num_samples", 128)),
+                    noise_sigma=float(m.get("noise_sigma", 0.4)), temperature=float(m.get("temperature", 0.05)),
+                    w_coll=float(m.get("w_wall", 5.0)), w_track=float(m.get("w_track", 1.0)))
         if self.validate_dynamics:
             from marinegym.utils.nominal_dynamics import NominalDynamics
             self.nominal = NominalDynamics(self.drone, self.dt * int(self.cfg.sim.get("substeps", 1)))
@@ -302,6 +412,13 @@ class Track(IsaacEnv):
                 obs_dim += 3  # obstacle velocity (fair: the policy gets full information too)
         if self.risk_in_obs:
             obs_dim += 1  # component A: predicted-risk scalar (one step delayed)
+        if self.cor_in_obs:
+            obs_dim += 2  # 论文②: 到两侧壁的有符号裕度（左/右各一维，策略才知道自己偏向哪边）
+        if self.flow_in_obs:
+            obs_dim += 1  # 论文②: 当前流速在受限轴上的分量（公平性：策略拿得到扰动信息）
+                          # 与 gust.enable 解耦，见 flow_in_obs 的说明
+        if self.cor_risk_in_obs:
+            obs_dim += 1  # 论文②: A 的预测风险标量（延迟一步）
 
         self.observation_spec = CompositeSpec({
             "agents": {
@@ -339,6 +456,17 @@ class Track(IsaacEnv):
             stats_spec_dict["detour_ratio"] = UnboundedContinuousTensorSpec(1)       # flown / reference path length (≥1, →1 best)
             stats_spec_dict["over_clearance"] = UnboundedContinuousTensorSpec(1)     # min_dist − safe_margin during encounters (small>0 best)
             stats_spec_dict["internalize_w"] = UnboundedContinuousTensorSpec(1)      # adaptive C weight w_C(t)
+        if self.corridor_enable:
+            # headline: wall_violation = 该 episode 是否触壁(0/1)；违约不终止 → 各方法曝光相同
+            stats_spec_dict["wall_violation"] = UnboundedContinuousTensorSpec(1)
+            stats_spec_dict["wall_viol_frac"] = UnboundedContinuousTensorSpec(1)   # 触壁步数占比（曝光归一化）
+            stats_spec_dict["wall_depth"] = UnboundedContinuousTensorSpec(1)       # 累计侵入深度 Σmax(0,−d)·dt
+            stats_spec_dict["min_wall_dist"] = UnboundedContinuousTensorSpec(1)    # 全 episode 最小侧壁裕度 (m)
+            stats_spec_dict["filter_lambda"] = UnboundedContinuousTensorSpec(1)    # 平均接管系数 λ（占空比故事）
+            stats_spec_dict["wall_correction"] = UnboundedContinuousTensorSpec(1)  # 平均 ‖u_safe−u_rl‖²
+            stats_spec_dict["d_hat_norm"] = UnboundedContinuousTensorSpec(1)       # ‖d̂‖ 观测器输出量级
+        if self.gust_enable:
+            stats_spec_dict["gust_speed"] = UnboundedContinuousTensorSpec(1)       # 当前阵风幅值 |v_c| EMA
         stats_spec = CompositeSpec(stats_spec_dict).expand(self.num_envs).to(self.device)
         self.observation_spec["stats"] = stats_spec
         self.stats = stats_spec.zero()
@@ -387,6 +515,121 @@ class Track(IsaacEnv):
             obstacle = obstacle + offset
         return obstacle
 
+    # ── 论文②：keep-in 走廊 ────────────────────────────────────────────────
+    def _ref_axis_extent(self, env_ids):
+        """该 episode 参考轨迹在受限轴上的最大 |偏移|（相对 origin）。
+
+        用解析的整周期采样，而不是 `_compute_traj`：后者依赖 progress_buf，而 reset
+        时 progress_buf 的清零时机不由本函数保证。lemniscate 在 t 上以 2π 为周期，
+        直接在 [0,2π] 上密采即可，与 traj_w / traj_t0 无关。
+        """
+        n, S = len(env_ids), 361
+        tt = torch.linspace(0., 2 * torch.pi, S, device=self.device).unsqueeze(0).expand(n, S)
+        pl = vmap(lemniscate)(tt, self.traj_c[env_ids])                             # [n,S,3]
+        rot = self.traj_rot[env_ids].unsqueeze(1).expand(-1, S, 4)
+        pl = vmap(quat_rotate)(rot, pl) * self.traj_scale[env_ids].unsqueeze(1)     # [n,S,3]
+        return pl[..., self.cor_axis].abs().amax(dim=1, keepdim=True)               # [n,1]
+
+    def _oracle_d_hat(self):
+        """上界消融：用仿真真值流速直接算出流引起的额外水动力，而不是在线估。
+
+        仿真里洋流是通过**相对速度**进入阻尼项的（underwaterVehicle.apply_hydrodynamic_forces
+        中 body_vels -= flow_vels_b），所以流引起的等效外力就是
+            hydro(v_b − v_flow,b) − hydro(v_b)
+        这给出观测器能达到的性能上界，用来量化在线估计的损失。
+        """
+        from marinegym.utils.torch import quat_rotate_inverse, quaternion_to_euler
+        vb = self.drone.vel_b
+        q = self.drone.rot
+        fw = self.drone.flow_vels
+        fb = torch.cat([
+            quat_rotate_inverse(q.reshape(-1, 4), fw[..., :3].reshape(-1, 3)).reshape_as(vb[..., :3]),
+            quat_rotate_inverse(q.reshape(-1, 4), fw[..., 3:].reshape(-1, 3)).reshape_as(vb[..., 3:]),
+        ], dim=-1)
+        rpy = quaternion_to_euler(q)
+        vp, ap = self.drone.prev_body_vels, self.drone.prev_body_acc
+        h_flow, _, _ = self._cnd.hydro_wrench(vb - fb, vp, ap, rpy)
+        h_still, _, _ = self._cnd.hydro_wrench(vb, vp, ap, rpy)
+        return h_flow - h_still
+
+    def _reset_corridor(self, env_ids):
+        if self.cor_half_width_abs is not None:
+            self._cor_hw[env_ids] = self.cor_half_width_abs
+        else:
+            # W = max|ref_axis| + r_v + margin
+            # 于是在参考轨迹最贴壁处，**完美跟踪**的载具恰好保留 margin 的裕度：
+            #     clearance = W − |y| − r_v = max|ref| + margin − |y|  →  |y|=max|ref| 时 = margin
+            # margin 因此是可直接解释的量，也是标定门控边界的基准：
+            # 必须 margin > soft_hi，否则完美跟踪时门控就已经常开，λ 永远 >0。
+            self._cor_hw[env_ids] = (self._ref_axis_extent(env_ids)
+                                     + self.cor_vehicle_radius + self.cor_margin)
+        self.stats["min_wall_dist"][env_ids] = 100.0   # 取 min 的累计量，须初始化为大值
+        # reset 那一步速度会跳变，残差会是垃圾；清掉 d̂ 与上一步状态，避免污染下一 episode
+        if getattr(self, "_dobs", None) is not None:
+            self._dobs.reset(env_ids)
+        if getattr(self, "_cor_prev", None) is not None:
+            self._cor_prev = None
+
+    # ── 论文②：阵风 ───────────────────────────────────────────────────────
+    def _launch_gust(self, env_ids, mask):
+        """给 env_ids[mask] 发一阵新风。
+
+        瞄准策略 curvature：阵风的**峰值时刻**对准参考轨迹在受限轴上的极值点 ——
+        载具在那里正换向（横向推力裕度最低）且最贴近侧壁。这是本篇"必须预测"的场景
+        支点，与论文①"瞄准未来参考位置"同构。
+
+        方向按**未来参考点**的所在侧，不是按载具当前位置：后者会形成正反馈跑飞
+        （一旦被推偏，之后每阵风都朝同方向推，载具单调飘走）。用参考点则与载具的
+        跟踪误差无关，扰动是外生的，各方法面对的是同一个扰动序列。
+        """
+        idx = env_ids[mask] if mask.dtype == torch.bool else env_ids
+        if idx.numel() == 0:
+            return
+        n = idx.numel()
+        lo, hi = self.gust_speed
+        amp = torch.rand(n, 1, device=self.device) * (hi - lo) + lo
+        r_lo, r_hi = self.gust_ramp
+        h_lo, h_hi = self.gust_hold
+        ramp = ((torch.rand(n, 1, device=self.device) * (r_hi - r_lo) + r_lo) / self.dt).round().clamp_min(1)
+        self._gust_ramp[idx] = ramp
+        self._gust_hold[idx] = ((torch.rand(n, 1, device=self.device) * (h_hi - h_lo) + h_lo) / self.dt).round().clamp_min(1)
+
+        # 在 lookahead 窗口内找参考轨迹在受限轴上 |偏移| 最大的那一步
+        k_lo, k_hi = self.gust_lookahead
+        traj = self._compute_traj(int(k_hi) + 1, idx, step_size=1.)          # [n,K,3]
+        off = traj[..., self.gust_axis] - self.origin[self.gust_axis]        # [n,K]
+        off[:, :int(k_lo)] = 0.                                              # 窗口下界之前不选
+        k_peak = off.abs().argmax(dim=1)                                     # [n]
+        ar = torch.arange(n, device=self.device)
+        side = torch.sign(off[ar, k_peak]).unsqueeze(-1)
+        side = torch.where(side == 0, torch.ones_like(side), side)
+        self._gust_amp[idx] = amp * side
+        # 让上升沿恰好在 k_peak 处走完 → 峰值与参考极值点对齐
+        now = self.progress_buf[idx].unsqueeze(-1).float()
+        self._gust_t0[idx] = now + (k_peak.unsqueeze(-1).float() - ramp).clamp_min(0.)
+        self._gust_next[idx] = now + self.gust_period      # 下一次重发的时刻（从本次发射算起）
+
+    def _update_gust(self):
+        """每步把阵风写进 drone.flow_vels（世界系）。
+
+        原实现只在 _reset_idx 写一次 flow_vels（每 episode 恒定 + 逐步噪声），
+        做不了时变阵风；这里改成逐步写入。梯形波：ramp 上升 → hold 保持 → ramp 下降。
+        """
+        p = self.progress_buf.unsqueeze(-1).float()                      # [E,1]
+        k = (p - self._gust_t0).clamp_min(0.)                            # 起风以来的步数
+        up = (k / self._gust_ramp).clamp(0., 1.)                         # 上升沿
+        dn = 1. - ((k - self._gust_ramp - self._gust_hold) / self._gust_ramp).clamp(0., 1.)   # 下降沿
+        prof = (up * dn).clamp_min(0.)                                   # 梯形 ∈[0,1]
+        v = self._gust_amp * prof                                        # [E,1] 带符号幅值
+        fv = self.drone.flow_vels
+        fv.zero_()
+        fv.reshape(self.num_envs, -1)[:, self.gust_axis] = v.squeeze(-1)
+        # 周期性重发，形成持续压力。用独立的 _gust_next 计时：_gust_t0 因为要对齐参考
+        # 极值点会被推到未来，拿它算周期会错。
+        due = p.squeeze(-1) >= self._gust_next.squeeze(-1)
+        if bool(due.any()):
+            self._launch_gust(torch.arange(self.num_envs, device=self.device), due)
+
     def _reset_idx(self, env_ids: torch.Tensor):
         if self.enable_flow:
             self.drone.set_flow_velocities(env_ids, self.max_flow_velocity, self.flow_velocity_gaussian_noise)
@@ -422,6 +665,11 @@ class Track(IsaacEnv):
 
         self.stats[env_ids] = 0.
 
+        if self.corridor_enable:
+            self._reset_corridor(env_ids)
+        if self.gust_enable:
+            self._launch_gust(env_ids, torch.ones(len(env_ids), dtype=torch.bool, device=self.device))
+
         if self.keepout_enable:
             # place N_OBSTACLES on the tracked reference (so a tracking policy must avoid them)
             n = len(env_ids)
@@ -453,6 +701,100 @@ class Track(IsaacEnv):
 
     def _pre_sim_step(self, tensordict: TensorDictBase):
         actions = tensordict[("agents", "action")]
+        if self.gust_enable:
+            self._update_gust()          # 必须在物理步之前写 flow_vels
+
+        # ── 论文②：扰动观测器 + A→λ→B（走廊版）──────────────────────────────
+        if self.corridor_enable and hasattr(self, "_cnd") and hasattr(self, "drone_state"):
+            u_rl = actions
+            # d̂：注意用的是**上一步**的状态/动作与本步真值速度的残差 —— 上一步的
+            # _cor_prev 是在上一次 _pre_sim_step 末尾存的（物理步之前），本步进来时
+            # drone 的 vel_b 已经是上一物理步之后的真值。
+            if self.dobs_zero:
+                self._d_hat.zero_()
+            elif self.dobs_enable and getattr(self, "_cor_prev", None) is not None:
+                self._dobs.update(self._cor_prev, self._cor_prev_a, self.drone.vel_b)
+                self._d_hat = self._dobs.d_hat
+            elif self.dobs_oracle:
+                # 上界消融：用仿真真值流速直接算等效阻尼力（不是在线估计）
+                self._d_hat = self._oracle_d_hat()
+
+            gate_clear = None
+            if self.cor_risk_enable:
+                # A 恒定运行：不管谁做门控，risk 标量都进观测 —— 这样几何门控消融
+                # 不会改变观测维度（论文①的做法，保证各格网络结构一致）
+                min_clear, risk, _ = self._cor_rm.assess_corridor(
+                    self.drone_state, self._cor_hw, u_rl, axis=self.cor_axis,
+                    center=float(self.origin[self.cor_axis]),
+                    vehicle_radius=self.cor_vehicle_radius, d_hat=self._d_hat)
+                self._cor_risk = risk.unsqueeze(-1)
+                if self.cor_risk_gate:
+                    gate_clear = min_clear                      # 预测门控
+                self._pred_clear = min_clear
+                if self.k4_enable:
+                    # K4：同一条前滚，换三种 d̂，比较预测最小裕度。离线再与"未来 H 步的
+                    # 实际最小裕度"对比 —— 直接测门控**真正用到的那个量**，而不是泛泛的
+                    # 位置预测误差。
+                    z = torch.zeros_like(self._d_hat)
+                    self._pred_clear_zero = self._cor_rm.assess_corridor(
+                        self.drone_state, self._cor_hw, u_rl, axis=self.cor_axis,
+                        center=float(self.origin[self.cor_axis]),
+                        vehicle_radius=self.cor_vehicle_radius, d_hat=z)[0]
+                    self._pred_clear_oracle = self._cor_rm.assess_corridor(
+                        self.drone_state, self._cor_hw, u_rl, axis=self.cor_axis,
+                        center=float(self.origin[self.cor_axis]),
+                        vehicle_radius=self.cor_vehicle_radius, d_hat=self._oracle_d_hat())[0]
+            if gate_clear is None and self.cor_mppi_enable:
+                gate_clear = self._cor_clear                    # 几何门控：当前侧壁裕度
+
+            if self.cor_mppi_enable and self.cor_force_lambda is not None:
+                # MPC-only 基线：λ≡常数(通常 1.0)，全程由 MPPI 接管，带参考跟踪代价。
+                # 这是"为什么不直接用 MPC"的对照组 —— 预期它 nominal 跟踪差、占空比 100%。
+                N = self._cor_mppi.N
+                ref = self._compute_traj(N, step_size=1.)                # [E,N,3]
+                lam = torch.full((self.num_envs, 1), self.cor_force_lambda, device=self.device)
+                actions = self._cor_mppi.filter_corridor(
+                    self.drone_state, self._cor_hw, u_rl, axis=self.cor_axis,
+                    center=float(self.origin[self.cor_axis]),
+                    vehicle_radius=self.cor_vehicle_radius, blend=lam, d_hat=self._d_hat,
+                    ref_traj=ref, w_ref=self.cor_mppi_w_ref)
+                self._cor_lam = lam
+                self._cor_corr = ((actions - u_rl) ** 2).sum(-1).reshape(self.num_envs, 1)
+                self._u_rl = u_rl.detach().clone()
+                self._u_applied = actions.detach().clone()
+                tensordict.set(("agents", "action"), actions)
+            elif self.cor_mppi_enable and gate_clear is not None:
+                if self.cor_mppi_soft:
+                    lam = ((self.cor_gate_boundary - gate_clear)
+                           / (self.cor_gate_boundary - self.cor_mppi_lo)).clamp(0.0, 1.0)
+                    # 同时传 active_mask：整批都 λ=0 时 filter_corridor 直接早退，
+                    # 完全跳过 K×N 次前滚。软接管路径漏了这个早退会让无风险时段
+                    # 也付全额 MPPI 代价（实测 2.4 s/步，评测矩阵根本跑不完）。
+                    actions = self._cor_mppi.filter_corridor(
+                        self.drone_state, self._cor_hw, u_rl, axis=self.cor_axis,
+                        center=float(self.origin[self.cor_axis]),
+                        vehicle_radius=self.cor_vehicle_radius, blend=lam,
+                        active_mask=(lam > 0), d_hat=self._d_hat)
+                else:
+                    trig = gate_clear < self.cor_gate_boundary
+                    lam = trig.float()
+                    actions = self._cor_mppi.filter_corridor(
+                        self.drone_state, self._cor_hw, u_rl, axis=self.cor_axis,
+                        center=float(self.origin[self.cor_axis]),
+                        vehicle_radius=self.cor_vehicle_radius, active_mask=trig, d_hat=self._d_hat)
+                self._cor_lam = lam.reshape(self.num_envs, 1)
+                self._cor_corr = ((actions - u_rl) ** 2).sum(-1).reshape(self.num_envs, 1)
+                self._u_rl = u_rl.detach().clone()             # 供轨迹采集：滤波前/后动作对
+                self._u_applied = actions.detach().clone()
+                tensordict.set(("agents", "action"), actions)
+            # 存本步（物理步之前）的状态与动作，供下一步算 d̂ 残差
+            self._cor_prev = {
+                "pos": self.drone_state[..., 0:3].clone(), "quat": self.drone.rot.clone(),
+                "vel_b": self.drone.vel_b.clone(), "throttle": self.drone.throttle.clone(),
+                "rpm": self.drone.rotor_params["rpm"].clone(),
+                "v_prev": self.drone.prev_body_vels.clone(), "acc_prev": self.drone.prev_body_acc.clone(),
+            }
+            self._cor_prev_a = actions.clone()
         if self.keepout_enable and self.dyn_enable:
             # obstacle kinematics: constant-velocity motion + periodic re-aim (sustained pressure)
             self.obstacle_pos += self.obstacle_vel * self.dt
@@ -595,6 +937,16 @@ class Track(IsaacEnv):
         self.target_pos[:] = self._compute_traj(self.future_traj_steps, step_size=5)
 
         self.rpos = self.target_pos - self.drone_state[..., :3]
+
+        if self.corridor_enable:
+            # keep-in 走廊（世界系侧壁）：clearance = 半宽 − |受限轴坐标| − 载具等效半径。
+            # 与跟踪误差是**两个不同的量** —— 参考线本身在 8 字两端就贴近侧壁，载具可以
+            # 跟得很准却仍贴壁，也可以跟得一般却远离侧壁。这是门控信号与奖励主项解耦的关键。
+            # 必须在拼 obs 之前算（obs 里要用到）。
+            self._cor_off = self.drone_state[..., self.cor_axis] - self.origin[self.cor_axis]  # [E,1] 有符号
+            self._cor_clear = self._cor_hw - self._cor_off.abs() - self.cor_vehicle_radius
+            self._cor_violate = self._cor_clear < 0
+
         obs = [
             self.rpos.flatten(1).unsqueeze(1),
             self.drone_state[..., 3:],
@@ -615,6 +967,20 @@ class Track(IsaacEnv):
                 obs.append(self.obstacle_vel[batched, closest_idx].reshape_as(drone_p))  # [E,1,3]
         if self.risk_in_obs:
             obs.append(self._risk)  # [E,1,1] component A risk scalar (1-step delayed)
+        if self.cor_in_obs:
+            # 到两侧壁的裕度分开给（而不是给 min），策略才知道自己偏向哪一侧
+            d_pos = (self._cor_hw - self._cor_off - self.cor_vehicle_radius).unsqueeze(-1)
+            d_neg = (self._cor_hw + self._cor_off - self.cor_vehicle_radius).unsqueeze(-1)
+            obs.append(torch.cat([d_pos, d_neg], dim=-1))            # [E,1,2]
+        if self.flow_in_obs:
+            # 公平性：策略拿得到扰动信息（真实 AUV 上 DVL 能测对水速度），
+            # 这样"策略知道有流仍然失败、带预测的滤波器成功"的对比才落在**预测**上，
+            # 而不是信息不对称。
+            # 用 flow_in_obs 而非 gust_enable：见其定义处 —— 观测维度不能随场景变。
+            _a = self.flow_obs_axis
+            obs.append(self.drone.flow_vels.reshape(self.num_envs, 1, -1)[..., _a:_a + 1])
+        if self.cor_risk_in_obs:
+            obs.append(self._cor_risk)   # [E,1,1]
         if self.time_encoding:
             t = (self.progress_buf / self.max_episode_length).unsqueeze(-1)
             obs.append(t.expand(-1, self.time_encoding_dim).unsqueeze(1))
@@ -634,6 +1000,26 @@ class Track(IsaacEnv):
             self._collision = (min_clearance < 0)
             self.stats["collision"] = torch.maximum(self.stats["collision"], self._collision.float())
             self.stats["min_obstacle_dist"] = torch.minimum(self.stats["min_obstacle_dist"], min_clearance)
+
+        if self.corridor_enable:
+            v = self._cor_violate.float()
+            self.stats["wall_violation"] = torch.maximum(self.stats["wall_violation"], v)
+            # 用 EMA 而不是"累计步数 + episode 末尾除以 ep_len"：
+            # EpisodeStats 收集的是逐步值再做平均，拿不到"末尾那一次除法"之后的结果
+            # （同样的原因让 stats.tracking_error 报出 -545 这种未归一化的累计值）。
+            # EMA 与 action_smoothness / tracking_error_ema 同一约定，可直接当占比读。
+            self.stats["wall_viol_frac"].lerp_(v, (1 - self.alpha))
+            self.stats["wall_depth"] += (-self._cor_clear).clamp_min(0.) * self.dt
+            self.stats["min_wall_dist"] = torch.minimum(self.stats["min_wall_dist"], self._cor_clear)
+            if hasattr(self, "_cor_lam"):
+                self.stats["filter_lambda"].lerp_(self._cor_lam, (1 - self.alpha))
+                self.stats["wall_correction"].lerp_(self._cor_corr, (1 - self.alpha))
+                self.stats["d_hat_norm"].lerp_(
+                    self._d_hat[..., :3].norm(dim=-1).reshape(self.num_envs, 1), (1 - self.alpha))
+        if self.gust_enable:
+            self.stats["gust_speed"].lerp_(
+                self.drone.flow_vels.reshape(self.num_envs, -1)[:, self.gust_axis].abs().unsqueeze(-1),
+                (1 - self.alpha))
 
         self.stats["action_smoothness"].lerp_(-self.drone.throttle_difference, (1-self.alpha))
         if self.keepout_enable:
@@ -690,6 +1076,12 @@ class Track(IsaacEnv):
             # _clearance is [E,1] = min across all obstacles
             pen = (self.reward_obstacle_margin - self._clearance).clamp_min(0.0)
             reward = reward - self.reward_obstacle_weight * pen * pen
+
+        if self.corridor_enable:
+            # 走廊接近惩罚：进入 margin 带后二次增长。和论文①一样，避壁是**任务的一部分**，
+            # 纯 PPO 有动机自己避 —— baseline 不是"根本不知道有墙"的弱 baseline。
+            wpen = (self.cor_reward_margin - self._cor_clear).clamp_min(0.0)
+            reward = reward - self.cor_reward_weight * wpen * wpen
             if self.internalize_adaptive:
                 # adaptive C: internalization pressure tracks recent reliance on the filter —
                 # heavy engagement raises the penalty, and it self-extinguishes once the
@@ -711,6 +1103,8 @@ class Track(IsaacEnv):
         terminated = misbehave | hasnan
         if self.keepout_enable and self.keepout_terminate:
             terminated = terminated | self._collision  # self._collision computed in _compute_state_and_obs
+        if self.corridor_enable and self.cor_terminate:
+            terminated = terminated | self._cor_violate
         truncated = (self.progress_buf >= self.max_episode_length - 1).unsqueeze(-1)
 
         ep_len = self.progress_buf.unsqueeze(-1)

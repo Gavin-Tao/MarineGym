@@ -97,3 +97,72 @@ keepout:
   internalize_gain: 5.0
   internalize_ema: 0.995   # per-step EMA decay of the mean engagement
   reset_thres: 1.5       # relaxed tracking-error threshold when keepout is on
+
+# ── 论文② (flow-safety)：keep-in 走廊 + 阵风。默认全关，与 keepout 完全独立 ──
+# 走廊是**世界系**侧壁（海沟/结构物之间），不是以参考点为中心的管道：
+# 以参考点为中心时 clearance = R − ‖p−p_ref‖ 是跟踪误差的单调函数，门控信号与
+# 奖励主项就是同一个量。世界系走廊让"贴壁裕度"与"跟踪误差"成为两个不同的量。
+corridor:
+  enable: false
+  axis: 1                  # 0=x 1=y 2=z，走廊受限的轴（lemniscate 在 y 上幅度最小，最贴壁）
+  margin: 0.8              # **完美跟踪的载具在最贴壁处保留的裕度 (m)** —— 半宽由此反推：
+                           #   W = max|ref_axis| + vehicle_radius + margin
+                           # 必须 > safety.mppi.soft_hi(0.6)，否则完美跟踪时门控就常开、λ 永远>0。
+                           # 违约需要约 margin 这么大的横向偏移，1 m/s 阵风持续 1.5 s 量级上可达。
+  half_width: null         # 非 null 时用绝对半宽，覆盖 margin（难度随 traj_scale 波动，一般别用）
+  vehicle_radius: 0.3
+  reward_weight: 2.0       # 贴壁惩罚权重（避壁是任务的一部分，PPO 自己有动机避）
+  reward_margin: 0.3       # 惩罚带宽度 (m)
+  in_obs: true             # 到两侧壁的裕度进观测（各一维，策略要知道偏向哪边）
+  terminate_on_violation: false   # 违约不终止 → 各方法曝光相同、违约率可比
+  freeze_traj_yaw: true    # 关掉轨迹绕 z 的随机旋转，世界系侧壁才有意义
+  reset_thres: 3.0         # 放宽跟踪误差终止，否则一飘出去就 reset，曝光不等
+
+# 阵风：梯形波（ramp 上升 → hold 保持 → ramp 下降），周期性重发。
+# 恒定均匀流对策略只是稳态偏置，会被 PPO 学掉（静态障碍失败模式的翻版）；
+# 必须快到策略来不及适应，且打在推力裕度最低的时刻。
+gust:
+  enable: false
+  speed: [0.6, 1.0]        # 幅值 m/s（训练档）
+  ramp: [0.2, 0.5]         # 上升/下降时间 s
+  hold: [1.0, 2.0]         # 保持时间 s
+  period: 200              # 每隔多少步重发一阵（3.2 s）
+  axis: 1                  # 沿走廊受限轴推
+  aim: curvature           # 推向载具当前所在的一侧（最快推向侧壁）
+  lookahead: [60, 200]     # 预留：瞄准未来 k 步的参考点
+
+# ── 论文② 的安全栈：A(预测风险) → λ → B(MPPI) ──
+# 与论文①同构，差别在于名义模型对未建模洋流是错的，必须靠 dobs 在线补偿。
+safety:
+  flow_in_obs: true        # 流速分量进观测。**独立于 gust.enable** —— 否则 calm 场景(关阵风)
+                           # 的观测维度比训练时少 1，同一 checkpoint 直接 shape mismatch，
+                           # "一条策略跑遍所有场景"的设计就废了。无阵风时该维恒为 0。
+  k4: false                # K4 诊断：同一条前滚同时算 d̂=0 / 在线估计 / oracle 三种预测，
+                           # 离线与"未来 H 步的实际最小裕度"对比。只在诊断时开。
+  dobs:                    # 扰动观测器（本篇一号技术组件）
+    enable: true
+    alpha: 0.1             # 一阶低通系数，时间常数 ≈ dt/alpha ≈ 0.16 s
+    clip: 200.0            # 单步残差上限，防 reset 那一步的速度跳变把估计带飞
+    oracle: false          # true=用仿真真值流速直接算 d̂（上界消融）
+    zero: false            # true=强制 d̂=0（退化成论文①的完美模型假设，消融用）
+  risk:                    # A：预测风险监视器
+    enable: false
+    horizon: 15            # 前滚步数 H（0.24 s）
+    threshold: 0.6         # 门控边界，须与 mppi.soft_hi 相同
+    gate: true             # true=预测门控；false=几何门控(当前裕度)，A 仍进观测
+    risk_norm: 2.0
+    in_obs: false          # 默认 false：所有滤波器格子共用同一条策略，观测维度必须一致。
+                           # risk 进观测是另一条独立的轴，用 riskobs 单独训一条策略比。
+  mppi:                    # B：MPPI 走廊滤波
+    enable: false
+    soft: true             # true=斜坡 λ；false=阶跃接管
+    soft_lo: 0.0
+    soft_hi: 0.6           # 与 risk.threshold 同值
+    num_samples: 128
+    horizon: 20
+    noise_sigma: 0.4
+    temperature: 0.05
+    w_wall: 5.0
+    w_track: 1.0           # 最小介入项 ‖a−u_rl‖²（作为滤波器时用这个）
+    w_ref: 0.0             # 参考跟踪项，仅 MPC-only 基线(λ≡1)开；>0 时 w_track 应设 0
+    force_lambda: null     # 非 null 时强制 λ 为该常数（MPC-only 基线设 1.0）

@@ -131,6 +131,60 @@ class MPPIExactShield:
         self.M = drone.num_rotors
 
     @torch.no_grad()
+    def filter_corridor(self, drone_state, half_width, u_rl, axis: int = 1, center: float = 0.0,
+                        vehicle_radius: float = 0.3, active_mask=None, blend=None, d_hat=None,
+                        ref_traj=None, w_ref: float = 0.0):
+        """论文②：keep-in 走廊版本。与 filter() 同一套 MPPI，只换代价里的安全项。
+
+        cost = w_coll · Σ_t relu(侵入深度)²  +  w_track · Σ_t ‖a_t − u_rl‖²
+
+        侵入深度 = −(W − |p_axis − c| − r_v)，即预测越过侧壁的部分。w_track 那项保持
+        "最小介入"语义（u_safe 不要离策略动作太远），与论文①一致。
+
+        d_hat [E,1,6]：在线估的体系等效外力残差，零阶保持注入前滚。名义模型对未建模
+        洋流是错的，不注入的话 MPPI 采样出的"安全"动作同样不可信。
+        """
+        E, K, N, M = drone_state.shape[0], self.K, self.N, self.M
+        if active_mask is not None and not active_mask.any():
+            return u_rl
+        u0 = u_rl.reshape(E, 1, M)
+
+        def rep(x):
+            return x.reshape(E, 1, -1).expand(E, K, -1).clone()
+        s = {
+            "pos": rep(drone_state[..., 0:3]), "quat": rep(drone_state[..., 3:7]),
+            "vel_b": rep(self.drone.vel_b), "throttle": rep(self.drone.throttle),
+            "rpm": rep(self.drone.rotor_params["rpm"]),
+            "v_prev": rep(self.drone.prev_body_vels), "acc_prev": rep(self.drone.prev_body_acc),
+        }
+        d_k = rep(d_hat) if d_hat is not None else None                       # [E,K,6]
+        W = half_width.reshape(E, 1)                                          # [E,1]
+        a_seq = (u0.unsqueeze(2) + self.sigma * torch.randn(E, K, N, M, device=self.device)).clamp(-1, 1)
+
+        cost = torch.zeros(E, K, device=self.device)
+        for t in range(N):
+            s = self.nd.step(s, a_seq[:, :, t], d_hat=d_k)
+            off = (s["pos"][..., axis] - center).abs()                        # [E,K]
+            pen = (off + vehicle_radius - W).clamp_min(0.0)                   # 预测侵入深度
+            cost = cost + self.w_coll * pen * pen
+            if ref_traj is not None and w_ref > 0.0:
+                # 参考跟踪项：仅 MPC-only 基线(λ≡1)需要。作为**滤波器**时不该有它 ——
+                # 跟踪是策略的职责，滤波器只做最小介入的安全修正。
+                # ref_traj [E,N,3]，取第 t 步的参考点。
+                e = (s["pos"] - ref_traj[:, t].reshape(E, 1, 3)).norm(dim=-1)  # [E,K]
+                cost = cost + w_ref * e * e
+        cost = cost + self.w_track * ((a_seq - u0.unsqueeze(2)) ** 2).sum((-1, -2))
+
+        w = torch.softmax(-(cost - cost.min(1, keepdim=True).values) / self.lam, dim=1)
+        u_safe = (w.unsqueeze(-1) * a_seq[:, :, 0]).sum(1)                    # [E,M]
+
+        if blend is not None:
+            lam_b = blend.reshape(E, 1).clamp(0.0, 1.0)
+            return (u0.reshape(E, M) + lam_b * (u_safe - u0.reshape(E, M))).view_as(u_rl)
+        if active_mask is not None:
+            return torch.where(active_mask.reshape(E, 1), u_safe, u0.reshape(E, M)).view_as(u_rl)
+        return u_safe.view_as(u_rl)
+
     def filter(self, drone_state, obstacle_pos, u_rl, active_mask=None, obstacle_vel=None, blend=None):
         """active_mask [E,1] bool (optional): predictive-risk gate from RiskMonitor (component A).
         Replaces the distance gate; if no env is triggered, MPPI is skipped entirely (zero cost).

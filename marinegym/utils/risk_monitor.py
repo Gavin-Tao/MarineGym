@@ -54,3 +54,32 @@ class RiskMonitor:
         risk = ((self.risk_norm - min_clear) / self.risk_norm).clamp(0.0, 1.0)
         trigger = min_clear < self.threshold
         return min_clear, risk, trigger
+
+    @torch.no_grad()
+    def assess_corridor(self, drone_state, half_width, u_rl, axis: int = 1,
+                        center: float = 0.0, vehicle_radius: float = 0.3, d_hat=None):
+        """论文②：keep-in 走廊版本。与 assess() 共用同一条前滚，只换 clearance 的定义。
+
+        clearance_k = W − |p_k,axis − c| − r_v      （keep-out 是 ‖p−p_o‖ − r，符号相反）
+
+        d_hat [E,1,6]：在线估计的体系等效外力残差，零阶保持注入前滚 —— 这是本篇相对
+        论文①的关键差异：名义模型对未建模洋流是错的，不注入 d̂ 的话 H 步预测本身不可信。
+        传 None 即退化成论文①的完美模型假设（消融用）。
+
+        returns (min_clear_pred [E,1], risk [E,1], trigger [E,1] bool)
+        """
+        s = {
+            "pos": drone_state[..., 0:3].clone(), "quat": drone_state[..., 3:7].clone(),
+            "vel_b": self.drone.vel_b.clone(), "throttle": self.drone.throttle.clone(),
+            "rpm": self.drone.rotor_params["rpm"].clone(),
+            "v_prev": self.drone.prev_body_vels.clone(), "acc_prev": self.drone.prev_body_acc.clone(),
+        }
+        W = half_width.reshape(-1, 1)                                    # [E,1]
+        min_clear = torch.full(drone_state.shape[:2], float("inf"), device=drone_state.device)
+        for _ in range(self.H):
+            s = self.nd.step(s, u_rl, d_hat=d_hat)                       # 动作零阶保持，d̂ 也零阶保持
+            off = (s["pos"][..., axis] - center).abs()                   # [E,1]
+            min_clear = torch.minimum(min_clear, W - off - vehicle_radius)
+        risk = ((self.risk_norm - min_clear) / self.risk_norm).clamp(0.0, 1.0)
+        trigger = min_clear < self.threshold
+        return min_clear, risk, trigger

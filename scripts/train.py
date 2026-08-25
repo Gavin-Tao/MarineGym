@@ -207,13 +207,17 @@ def main(cfg):
         base_env.eval(); env.eval()
         n_steps = int(cfg.get("traj_steps", 240))
         rec = {k: [] for k in ("pos", "ref", "obst", "quat", "vel", "engage", "clearance",
-                               "u_rl", "u_applied", "done")}
+                               "u_rl", "u_applied", "done", "reward", "flow",
+                               "wall_clear", "wall_hw", "lam", "d_hat",
+                               "pred_clear", "pred_clear_zero", "pred_clear_oracle")}
         td = env.reset()
         be = base_env
         # 完整参考轨迹（整条 lemniscate，从 reset 时刻起算 max_episode_length 步）
         # —— 用于在轨迹图上显示载具在整条路径上走到了哪
         try:
-            full_ref = be._compute_traj(be.max_episode_length, step_size=1.0).cpu().numpy()
+            # 上限 2000 步：max_episode_length 被调大时（长漂移诊断会设到上万），
+            # 这里的 vmap 会退化成一个巨大的逐步计算并把整个采集卡住。
+            full_ref = be._compute_traj(min(int(be.max_episode_length), 2000), step_size=1.0).cpu().numpy()
         except Exception as ex:
             logging.warning(f"full_ref 采集失败: {ex}")
             full_ref = None
@@ -244,6 +248,23 @@ def main(cfg):
                 rec["clearance"].append(cl.reshape(-1).cpu().numpy().copy()
                                         if cl is not None else np.full(be.num_envs, np.nan, dtype=np.float32))
                 rec["done"].append(td["next", "done"].reshape(-1).cpu().numpy().copy())
+                # V0 回归指纹：reward 是 env 全部改动的最敏感汇总量（奖励项一动就变）
+                rec["reward"].append(td["next", "agents", "reward"].reshape(-1).cpu().numpy().copy())
+                # 论文②走廊：侧壁裕度与该 episode 的半宽（V6 违约计数验证用）
+                for key, attr in (("wall_clear", "_cor_clear"), ("wall_hw", "_cor_hw"), ("lam", "_cor_lam"),
+                                  ("pred_clear", "_pred_clear"),          # K4: 三种 d̂ 下的预测最小裕度
+                                  ("pred_clear_zero", "_pred_clear_zero"),
+                                  ("pred_clear_oracle", "_pred_clear_oracle")):
+                    v = getattr(be, attr, None)
+                    rec[key].append(v.reshape(-1).cpu().numpy().copy()
+                                    if v is not None else np.full(be.num_envs, np.nan, dtype=np.float32))
+                _dh = getattr(be, "_d_hat", None)   # 观测器输出（体系等效外力残差，6 维）
+                rec["d_hat"].append(_dh.reshape(be.num_envs, -1)[:, :6].cpu().numpy().copy()
+                                    if _dh is not None else np.full((be.num_envs, 6), np.nan, dtype=np.float32))
+                # V1/V2/V3/V5 洋流验证：世界系流速 [lin(3), ang(3)]，每步记录
+                fv = getattr(be.drone, "flow_vels", None)
+                rec["flow"].append(fv.reshape(be.num_envs, -1)[:, :6].cpu().numpy().copy()
+                                   if fv is not None else np.zeros((be.num_envs, 6), dtype=np.float32))
                 td = step_mdp(td)
         out = {k: np.asarray(v) for k, v in rec.items()}
         if full_ref is not None: out["full_ref"] = full_ref
@@ -289,6 +310,36 @@ def main(cfg):
             info.update(stats)
 
         info.update(policy.train_op(data.to_tensordict()))
+
+        # 论文②：训练曲线落盘 + 控制台摘要。
+        # 原实现只把统计发给 wandb(offline)，无人值守时既看不到进展，也没法直接画训练曲线。
+        _tl = cfg.get("train_log", None)
+        # 前几个迭代还没有任何完整 episode，info 里没有 train/stats.*。若此时就定表头，
+        # wall_violation 这些关键列会永远缺席。等到 stats 真的出现再开始记。
+        if _tl and any(k.startswith("train/stats.") for k in info):
+            import csv as _csv
+            # 表头必须**只定一次**：前几个迭代还没有完整 episode，info 的键更少，
+            # 逐行重算 fieldnames 会写出列数不一致的 CSV（pandas 直接解析失败）。
+            # 因此第一次写入时定下表头并复用；缺的键留空，多出来的丢弃。
+            if not hasattr(main, "_tl_fields"):
+                if os.path.exists(_tl):
+                    with open(_tl) as _f:
+                        main._tl_fields = next(_csv.reader(_f))
+                else:
+                    main._tl_fields = ["iter"] + sorted(
+                        k for k in info if isinstance(info[k], (int, float)))
+                    with open(_tl, "w", newline="") as _f:
+                        _csv.DictWriter(_f, fieldnames=main._tl_fields).writeheader()
+            with open(_tl, "a", newline="") as _f:
+                _csv.DictWriter(_f, fieldnames=main._tl_fields, extrasaction="ignore",
+                                restval="").writerow({"iter": i, **info})
+            if i % 10 == 0:
+                _pick = [(k.split("stats.")[-1], info[k]) for k in
+                         ("train/stats.wall_violation", "train/stats.wall_viol_frac",
+                          "train/stats.tracking_error_ema", "train/stats.min_wall_dist",
+                          "train/stats.episode_len", "train/stats.return") if k in info]
+                if _pick:
+                    print("[it %4d] " % i + "  ".join(f"{k}={v:.4f}" for k, v in _pick), flush=True)
 
         train_actions = data.get(("agents", "action"))
         if train_actions is not None:
