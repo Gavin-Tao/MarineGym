@@ -1,0 +1,4 @@
+scene,ppo_rate,episodes_per_arm,detectable_rel_drop
+nominal,0.00777,1405,0.891
+ood,0.01637,1418,0.667
+hard,0.7476,402,0.121

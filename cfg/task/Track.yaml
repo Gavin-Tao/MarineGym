@@ -83,7 +83,8 @@ keepout:
   risk:
     enable: false
     horizon: 15          # H-step lookahead
-    threshold: 0.3       # trigger B when predicted min clearance < this (m)
+    threshold: 0.6       # 门控边界，必须与 mppi.soft_hi 相同（同一量的阶跃/斜坡参数化）
+    gate: true           # A 是否充当门控；false → A 仍进观测，门控退回几何(当前间隙)
     risk_norm: 2.0       # risk = clip((risk_norm - min_clear)/risk_norm, 0, 1)
     in_obs: true         # feed the risk scalar into the policy observation
   # component C: safety internalization (penalize B's correction so the policy learns it)

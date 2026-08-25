@@ -68,6 +68,9 @@ class Track(IsaacEnv):
             self.risk_cfg = keepout_cfg.get("risk", None)
             self.risk_enable = bool(self.risk_cfg is not None and self.risk_cfg.get("enable", False))
             self.risk_in_obs = bool(self.risk_enable and self.risk_cfg.get("in_obs", True))
+            # 解耦：A 是否「跑并喂观测」(risk.enable) 与 A 是否「充当门控」(risk.gate)。
+            # gate=false → A 仍进观测，但门控退回几何(当前间隙)，使几何消融与本方法观测一致。
+            self.risk_gate = bool(self.risk_enable and self.risk_cfg.get("gate", True))
             self.internalize_weight = float(keepout_cfg.get("internalize_weight", 0.0))
             # adaptive C: w_C = gain * EMA(mean filter engagement), self-extinguishing
             self.internalize_adaptive = bool(keepout_cfg.get("internalize_adaptive", False))
@@ -78,6 +81,13 @@ class Track(IsaacEnv):
             self.mppi_soft = bool(self.mppi_enable and self.mppi_cfg.get("soft_blend", False))
             self.mppi_soft_lo = float(self.mppi_cfg.get("soft_lo", 0.0)) if self.mppi_cfg else 0.0
             self.mppi_soft_hi = float(self.mppi_cfg.get("soft_hi", 0.6)) if self.mppi_cfg else 0.6
+            # 整套实验只允许存在一个门控边界；threshold 与 soft_hi 是同一量的阶跃/斜坡参数化。
+            self.gate_boundary = float(self.mppi_soft_hi)
+            _thr = float(self.risk_cfg.get("threshold", 0.3)) if self.risk_cfg else self.gate_boundary
+            if self.risk_enable and abs(_thr - self.gate_boundary) > 1e-9:
+                import logging
+                logging.warning("keepout: risk.threshold=%.3g != mppi.soft_hi=%.3g; "
+                                "使用 soft_hi 作为唯一门控边界。", _thr, self.gate_boundary)
             # pure-A-soft ablation: A's λ + cheap reactive REPULSION action (no MPPI) — "field" actor
             fld = keepout_cfg.get("field", None)
             self.field_enable = bool(fld is not None and fld.get("enable", False))
@@ -96,6 +106,8 @@ class Track(IsaacEnv):
             self.internalize_weight = 0.0
             self.internalize_adaptive = False
             self.mppi_soft = False
+            self.risk_gate = False
+            self.gate_boundary = 0.6
             self.field_enable = False
             self.dyn_enable = False
 
@@ -216,6 +228,7 @@ class Track(IsaacEnv):
                 logging.warning("risk monitor needs a pure-thruster (T200) vehicle; disabling.")
                 self.risk_enable = False
                 self.risk_in_obs = False
+                self.risk_gate = False
         if self.field_enable:
             # field actor needs thruster axes; reuse (or build) NominalDynamics for its Blin extraction
             if not hasattr(self, "_nd"):
@@ -457,30 +470,28 @@ class Track(IsaacEnv):
             # A: predictive risk (single exact-model rollout of the policy's own action)
             trigger = None
             blend = None
+            min_clear = None
+            # --- A 恒定运行：只要 risk.enable，就前滚预测并把 risk 标量喂进观测，
+            #     与「谁来做门控」无关（这样几何门控消融不会改变观测维度）。---
             if self.risk_enable:
-                min_clear, risk, trigger = self.risk_monitor.assess(self.drone_state, closest, u_rl, obstacle_vel=closest_vel)
+                min_clear, risk, _ = self.risk_monitor.assess(
+                    self.drone_state, closest, u_rl, obstacle_vel=closest_vel)
                 self._risk = risk.unsqueeze(-1)                              # [E,1,1] → next obs (1-step delay)
+            # --- 门控信号：预测间隙(A 门控) 或 当前间隙(几何门控) ---
+            gate_clear = None
+            if self.risk_enable and self.risk_gate:
+                gate_clear = min_clear                                       # 预测式门控
+            elif self.mppi_enable or self.field_enable:
+                gate_clear = ((self.drone_state[..., :3].reshape(-1, 3) - closest).norm(dim=-1, keepdim=True)
+                              - (self.keepout_radius + self.vehicle_radius))  # 几何门控
+            # --- 接管形状：斜坡(soft) 或 阶跃(binary)，共用同一边界 gate_boundary ---
+            if gate_clear is not None:
                 if self.mppi_soft or self.field_enable:
-                    # risk-proportional soft takeover: λ ramps 0→1 as PREDICTED clearance falls hi→lo
-                    blend = ((self.mppi_soft_hi - min_clear)
-                             / (self.mppi_soft_hi - self.mppi_soft_lo)).clamp(0.0, 1.0)
+                    blend = ((self.gate_boundary - gate_clear)
+                             / (self.gate_boundary - self.mppi_soft_lo)).clamp(0.0, 1.0)
                     trigger = blend > 0
-                self._risk_trigger = trigger
-            elif self.mppi_soft:
-                # pure-B-soft ablation: λ from CURRENT clearance (no prediction)
-                clearance_now = ((self.drone_state[..., :3].reshape(-1, 3) - closest).norm(dim=-1, keepdim=True)
-                                 - (self.keepout_radius + self.vehicle_radius))
-                blend = ((self.mppi_soft_hi - clearance_now)
-                         / (self.mppi_soft_hi - self.mppi_soft_lo)).clamp(0.0, 1.0)
-                trigger = blend > 0
-                self._risk_trigger = trigger
-            elif self.mppi_enable:
-                # geometric-gate hard ablation: binary trigger from CURRENT clearance,
-                # using the same 0.6 m boundary as the soft ramp so the 2x2 differs only
-                # in step-vs-ramp, not in where the boundary sits.
-                clearance_now = ((self.drone_state[..., :3].reshape(-1, 3) - closest).norm(dim=-1, keepdim=True)
-                                 - (self.keepout_radius + self.vehicle_radius))
-                trigger = clearance_now < self.mppi_soft_hi
+                else:
+                    trigger = gate_clear < self.gate_boundary
                 self._risk_trigger = trigger
             # protection chain — policy → (shield) → field OR MPPI
             if self.shield_enable:

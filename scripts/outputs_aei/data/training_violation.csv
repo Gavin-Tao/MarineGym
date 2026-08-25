@@ -1,0 +1,7 @@
+variant,collisions,episodes,rate,ci_lo,ci_hi
+Geometric + prop.,2,448,0.00446,0.00123,0.01613
+RP-PSF (ours),2,426,0.00469,0.00129,0.01695
+A-only,3,433,0.00693,0.00236,0.02017
+Geometric + binary,4,449,0.00891,0.00347,0.02268
+Predictive + binary,6,452,0.01327,0.0061,0.02865
+PPO baseline,6,420,0.01429,0.00656,0.03081

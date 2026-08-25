@@ -42,8 +42,16 @@ def read_eval(path):
 
 def main():
     # --- 训练曲线 ---
+    # 内化 C 的两次训练不属于本方法，其曲线也不收进数据集
+    excl = set()
+    for lbl in ("r1d_fixed_C", "r1e_adaptive_C"):
+        fp = os.path.join(ROOT, "outputs_aei", f"{lbl}.log")
+        if os.path.exists(fp):
+            m = re.search(r"offline-run-([0-9_]+)-", open(fp, errors="replace").read())
+            if m: excl.add(m.group(1))
     tr_rows = []
     for run in sorted(glob.glob(os.path.join(ROOT, "wandb", "offline-run-*"))):
+        if any(e in run for e in excl): continue
         rows = read_wandb(run)
         if not rows: continue
         cum = 0.0
@@ -67,8 +75,10 @@ def main():
     ev_rows = []
     for p in sorted(glob.glob(os.path.join(ROOT, "outputs_aei", "eval", "*.log"))):
         base = os.path.basename(p)[:-4]
-        m = re.match(r"(.+)_(nominal|ood)_s(\d+)$", base)
+        m = re.match(r"(.+)_(nominal|ood|hard)_s(\d+)$", base)
         if not m: continue
+        # 内化 C 不属于本方法（A 风险门控 + B MPPI 滤波 + soft blend），不进数据集
+        if m.group(1) in ("r1d_fixed_C", "r1e_adaptive_C"): continue
         d = read_eval(p)
         if not d: continue
         d.update(model=m.group(1), scene=m.group(2), seed=int(m.group(3)))
