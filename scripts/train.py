@@ -279,7 +279,14 @@ def main(cfg):
         base_env.eval(); env.eval()
         n_eval_ep = int(cfg.get("eval_episodes", 200))
         max_batches = int(cfg.get("eval_max_batches", 45))   # wall-clock guard (episodes can be long)
-        with set_exploration_type(ExplorationType.MODE):
+        # 诊断开关：默认 MODE(取分布 mode = 确定性动作)。设 +eval_explore=random 则改为
+        # 采样动作，与训练时一致 —— 用来区分"评测路径取动作的方式有问题"和
+        # "训练时报出的指标本身乐观"这两种情况。
+        _ex = {"random": ExplorationType.RANDOM, "mode": ExplorationType.MODE,
+               "mean": ExplorationType.MEAN}.get(str(cfg.get("eval_explore", "mode")).lower(),
+                                                 ExplorationType.MODE)
+        logging.info(f"EVAL-ONLY: exploration_type={_ex}")
+        with set_exploration_type(_ex):
             for bi, data in enumerate(collector):
                 episode_stats.add(data.to_tensordict())
                 if bi % 5 == 0:
