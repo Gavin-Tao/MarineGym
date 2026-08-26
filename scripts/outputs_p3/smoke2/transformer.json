@@ -1,0 +1,91 @@
+{
+ "arm": "transformer",
+ "encoder": {
+  "name": "transformer",
+  "d_model": 96,
+  "n_layers": 1,
+  "n_heads": 8,
+  "d_state": 16,
+  "d_conv": 4,
+  "expand": 2,
+  "max_len": 16
+ },
+ "context_len": 16,
+ "pomdp": {
+  "drop_linear_vel": true,
+  "drop_angular_vel": true,
+  "obs_delay": 0,
+  "sparse_pos_period": 1,
+  "obs_noise_std": 0.0,
+  "obs_dropout": 0.0
+ },
+ "seed": 0,
+ "total_frames": 4096,
+ "param_count": {
+  "actor": 143142,
+  "critic": 142625
+ },
+ "train_wall_s": 95.48358917236328,
+ "eval_wall_s": 31.54839062690735,
+ "eval_episodes": 166,
+ "eval": {
+  "eval/stats.stats.tracking_error": {
+   "mean": -12.091436386108398,
+   "std": 1.7421144247055054,
+   "n": 55
+  },
+  "eval/stats.stats.return": {
+   "mean": 53.84125518798828,
+   "std": 7.485011577606201,
+   "n": 55
+  },
+  "eval/stats.stats.tracking_error_ema": {
+   "mean": 0.4441632926464081,
+   "std": 0.008033876307308674,
+   "n": 55
+  },
+  "eval/stats.stats.action_smoothness": {
+   "mean": 0.0,
+   "std": 0.0,
+   "n": 55
+  },
+  "eval/stats.stats.episode_len": {
+   "mean": 63.14545440673828,
+   "std": 8.729299545288086,
+   "n": 55
+  }
+ },
+ "curve": [
+  {
+   "env_frames": 4096,
+   "rollout_fps": 164.03789494729443,
+   "explained_var": 0.12944068014621735,
+   "critic_grad_norm": 1.0434577465057373,
+   "policy_loss": 0.004283341579139233,
+   "entropy": 4.251474380493164,
+   "value_loss": 0.4715466797351837,
+   "actor_grad_norm": 6.148853302001953,
+   "train/stats.avg_power_W": 597.2903442382812,
+   "iter": 0,
+   "wall_s": 29.878222227096558
+  },
+  {
+   "env_frames": 8192,
+   "rollout_fps": 135.604349848996,
+   "train/stats.tracking_error": -11.539652824401855,
+   "train/stats.return": 51.31761932373047,
+   "train/stats.tracking_error_ema": 0.4420105814933777,
+   "train/stats.action_smoothness": 0.0,
+   "train/stats.episode_len": 60.180179595947266,
+   "explained_var": 0.5501066446304321,
+   "critic_grad_norm": 0.7228215932846069,
+   "policy_loss": -0.0015488353092223406,
+   "entropy": 4.24683952331543,
+   "value_loss": 0.42659419775009155,
+   "actor_grad_norm": 4.942445278167725,
+   "train/stats.avg_power_W": 595.2409057617188,
+   "iter": 1,
+   "wall_s": 63.93267750740051
+  }
+ ]
+}

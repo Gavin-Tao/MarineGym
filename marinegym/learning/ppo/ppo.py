@@ -33,12 +33,13 @@ from tensordict import TensorDict
 from tensordict.nn import TensorDictModuleBase, TensorDictModule, TensorDictSequential
 
 from hydra.core.config_store import ConfigStore
-from dataclasses import dataclass
-from typing import Union
+from dataclasses import dataclass, field
+from typing import Union, Any
 import einops
 
 from ..utils.valuenorm import ValueNorm1
 from ..modules.distributions import IndependentNormal
+from ..modules.encoders import build_encoder
 from .common import GAE
 
 @dataclass
@@ -55,6 +56,17 @@ class PPOConfig:
     checkpoint_path: Union[str, None] = None
 
     lr: float = 5e-4
+
+    # 论文③：序列编码器。name ∈ {mlp, stack, gru, transformer, mamba}
+    # 观测形状恒为 [..., n_agents, L, obs_dim]（L=task.context_len）。
+    # mlp 只取窗口末位 → "只考虑当前 state" 的下界基线。
+    # 键需预先存在，hydra 才能用 algo.encoder.x=y 直接覆盖（不必加 '+'）。
+    # build_encoder 按各臂 __init__ 签名过滤，无关键自动忽略，
+    # 所以一份默认值可以喂所有臂。hidden 不放这里 —— 各臂默认值已做过参数量对齐。
+    encoder: Any = field(default_factory=lambda: {
+        "name": "mlp", "d_model": 128, "n_layers": 1,
+        "n_heads": 4, "d_state": 16, "d_conv": 4, "expand": 2,
+    })
 
 cs = ConfigStore.instance()
 cs.store("ppo", node=PPOConfig, group="algo")
@@ -105,6 +117,15 @@ class PPOPolicy(TensorDictModuleBase):
 
         fake_input = observation_spec.zero()
 
+        # 观测形状恒为 [..., n_agents, L, obs_dim]；把 L 传给编码器，
+        # 这样 DTQN 的可学习位置编码按 context_len 分配（与上游一致），
+        # 不会因为预留一个大 max_len 而虚增参数量。
+        _obs_shape = observation_spec[("agents", "observation")].shape
+        _ctx_len = int(_obs_shape[-2])
+        _enc_cfg = dict(self.cfg.encoder)
+        _enc_cfg.setdefault("max_len", _ctx_len)
+        self.encoder_cfg = _enc_cfg
+
         if self.cfg.priv_actor:
             intrinsics_dim = observation_spec[("agents", "intrinsics")].shape[-1]
             actor_module = TensorDictSequential(
@@ -121,7 +142,7 @@ class PPOPolicy(TensorDictModuleBase):
             )
         else:
             actor_module=TensorDictModule(
-                nn.Sequential(make_mlp([256, 256, 256]), Actor(self.action_dim)),
+                nn.Sequential(build_encoder(self.encoder_cfg), Actor(self.action_dim)),
                 [("agents", "observation")], ["loc", "scale"]
             )
         self.actor: ProbabilisticActor = ProbabilisticActor(
@@ -148,21 +169,43 @@ class PPOPolicy(TensorDictModuleBase):
             ).to(self.device)
         else:
             self.critic = TensorDictModule(
-                nn.Sequential(make_mlp([256, 256, 256]), nn.LazyLinear(1)),
+                nn.Sequential(build_encoder(self.encoder_cfg), nn.LazyLinear(1)),
                 [("agents", "observation")], ["state_value"]
             ).to(self.device)
 
         self.actor(fake_input)
         self.critic(fake_input)
 
+        # LazyLinear 在首次前向后才有真实 shape，此处统计才准确
+        _n = lambda m: sum(p.numel() for p in m.parameters())
+        self.param_count = {"actor": _n(self.actor), "critic": _n(self.critic)}
+        print(f"[paper3] encoder={self.encoder_cfg} ctx_len={_ctx_len} "
+              f"obs_shape={tuple(fake_input[('agents','observation')].shape[-2:])} "
+              f"params: actor={self.param_count['actor']:,} "
+              f"critic={self.param_count['critic']:,}", flush=True)
+
         if self.cfg.checkpoint_path is not None:
             state_dict = torch.load(self.cfg.checkpoint_path)
             self.load_state_dict(state_dict, strict=False)
         else:
+            # 序列编码器（GRU / DTQN-Transformer / Mamba）自带精心设计的初始化：
+            #   Mamba 的 dt_proj bias / A_log / D、GRUGate 的 w_z.bias=-2、
+            #   cuDNN GRU 的 uniform(±1/√H) 等。
+            # 若被这里的 orthogonal(0.01) 覆盖会毁掉这些参数化，
+            # 因此只对策略头/值头/输入投影施加，编码器内核保持上游初始化。
+            protected = set()
+            for m in list(self.actor.modules()) + list(self.critic.modules()):
+                if hasattr(m, "protected_modules"):
+                    for pm in m.protected_modules():
+                        protected.update(id(x) for x in pm.modules())
+
             def init_(module):
+                if id(module) in protected:
+                    return
                 if isinstance(module, nn.Linear):
                     nn.init.orthogonal_(module.weight, 0.01)
-                    nn.init.constant_(module.bias, 0.)
+                    if module.bias is not None:      # Mamba 的投影层 bias=False
+                        nn.init.constant_(module.bias, 0.)
 
             self.actor.apply(init_)
             self.critic.apply(init_)
@@ -177,10 +220,21 @@ class PPOPolicy(TensorDictModuleBase):
         tensordict.exclude("loc", "scale", "feature", inplace=True)
         return tensordict
 
+    def _critic_chunked(self, td: TensorDict, chunk: int = 8):
+        """按时间维分块的 no_grad critic 前向。
+
+        4096 envs 时整个 batch 是 [64, 4096] = 262k 个样本，序列编码器一次
+        前向要 >2 GB 激活，共享 GPU 上直接 OOM。分块与整批**数学完全等价**
+        （无 BN 等跨样本统计），只是峰值显存 /chunk。"""
+        outs = []
+        for i in range(0, td.shape[0], chunk):
+            outs.append(self.critic(td[i:i + chunk])["state_value"])
+        return torch.cat(outs, dim=0)
+
     def train_op(self, tensordict: TensorDict):
         next_tensordict = tensordict["next"]
         with torch.no_grad():
-            next_values = self.critic(next_tensordict)["state_value"]
+            next_values = self._critic_chunked(next_tensordict)
         rewards = tensordict[("next", "agents", "reward")]
         dones = einops.repeat(
             tensordict[("next", "terminated")],

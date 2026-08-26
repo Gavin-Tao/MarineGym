@@ -1,0 +1,9 @@
+{
+ "median_episode_len": 67,
+ "mean_ref_speed": 0.5426117181777954,
+ "mean_vehicle_speed": 0.27924779057502747,
+ "speed_deficit": 0.26336392760276794,
+ "err_growth_rate_m_per_s": 0.4128185607202949,
+ "reset_thres": 0.5,
+ "predicted_episode_len_steps": 118.65710040265805
+}

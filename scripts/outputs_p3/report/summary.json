@@ -1,0 +1,101 @@
+{
+ "rows": [
+  {
+   "cond": "drift_oracle",
+   "arm": "mlp",
+   "n_seeds": 1,
+   "params": 144390,
+   "context_len": 1,
+   "train_wall_s": 4263.232048034668,
+   "episode_len_mean": 76.4313735961914,
+   "episode_len_std": 3.1384090403651776,
+   "return_mean": 64.28819274902344,
+   "return_std": 2.5028096864053437,
+   "tracking_err_mean": 0.4521948993206024,
+   "tracking_err_std": 0.0015594739727505895
+  },
+  {
+   "cond": "drift_oracle",
+   "arm": "stack",
+   "n_seeds": 1,
+   "params": 182918,
+   "context_len": 16,
+   "train_wall_s": 4366.900434732437,
+   "episode_len_mean": 79.9000015258789,
+   "episode_len_std": 4.029824634345942,
+   "return_mean": 66.5008773803711,
+   "return_std": 3.1700016835517326,
+   "tracking_err_mean": 0.4545297622680664,
+   "tracking_err_std": 0.0021165086010642466
+  },
+  {
+   "cond": "drift_oracle",
+   "arm": "mamba",
+   "n_seeds": 1,
+   "params": 156550,
+   "context_len": 16,
+   "train_wall_s": 4307.179868936539,
+   "episode_len_mean": 80.96078491210938,
+   "episode_len_std": 3.334426565051992,
+   "return_mean": 68.54045867919922,
+   "return_std": 2.6309509330627394,
+   "tracking_err_mean": 0.45144760608673096,
+   "tracking_err_std": 0.001986854836813378
+  },
+  {
+   "cond": "drift",
+   "arm": "mlp",
+   "n_seeds": 1,
+   "params": 143622,
+   "context_len": 1,
+   "train_wall_s": 4150.6266894340515,
+   "episode_len_mean": 76.11538696289062,
+   "episode_len_std": 3.3528823567366404,
+   "return_mean": 64.84718322753906,
+   "return_std": 3.028718902401246,
+   "tracking_err_mean": 0.44853687286376953,
+   "tracking_err_std": 0.0015963555015890555
+  },
+  {
+   "cond": "drift",
+   "arm": "stack",
+   "n_seeds": 1,
+   "params": 176774,
+   "context_len": 16,
+   "train_wall_s": 4415.186821937561,
+   "episode_len_mean": 74.17646789550781,
+   "episode_len_std": 3.060014797021064,
+   "return_mean": 62.19219207763672,
+   "return_std": 2.4069792467329365,
+   "tracking_err_mean": 0.44952961802482605,
+   "tracking_err_std": 0.0017575324000411324
+  },
+  {
+   "cond": "drift",
+   "arm": "mamba",
+   "n_seeds": 1,
+   "params": 156166,
+   "context_len": 16,
+   "train_wall_s": 4290.944443225861,
+   "episode_len_mean": 81.8448257446289,
+   "episode_len_std": 4.053170730228248,
+   "return_mean": 69.13484191894531,
+   "return_std": 3.3006083648119904,
+   "tracking_err_mean": 0.4495479464530945,
+   "tracking_err_std": 0.001729504706145743
+  }
+ ],
+ "counts": {
+  "drift": {
+   "mamba": 1,
+   "mlp": 1,
+   "stack": 1
+  },
+  "drift_oracle": {
+   "mamba": 1,
+   "mlp": 1,
+   "stack": 1
+  }
+ },
+ "diverged": []
+}

@@ -1,6 +1,8 @@
 import logging
+import math
 import os
 import time
+import json
 
 import hydra
 import torch
@@ -275,6 +277,11 @@ def main(cfg):
         simulation_app.close()
         return
 
+    # 论文③：把每次迭代的标量指标累积下来，最后连同确定性评测一起写 JSON
+    p3_out = cfg.get("p3_out", None)
+    p3_curve = []
+    p3_t0 = time.time()
+
     pbar = tqdm(collector, total=total_frames//frames_per_batch)
     env.train()
     for i, data in enumerate(pbar):
@@ -309,12 +316,167 @@ def main(cfg):
                 logging.warning(f"Policy {policy} does not implement `.state_dict()`")
 
         run.log(info)
+        if p3_out:
+            p3_curve.append({k: v for k, v in info.items()
+                             if isinstance(v, (int, float))} | {"iter": i,
+                             "wall_s": time.time() - p3_t0})
         print(OmegaConf.to_yaml({k: v for k, v in info.items() if isinstance(v, float)}))
 
         pbar.set_postfix({"rollout_fps": collector._fps, "frames": collector._frames})
 
         if max_iters > 0 and i >= max_iters - 1:
             break
+
+    # ---- 论文③：确定性评测 + 结果落盘 ----
+    if p3_out:
+        # 用 collector 聚合**所有完整 episode**（而不是 evaluate() 那样一次 600 步
+        # rollout 只取每个 env 的第一条 episode）。episode 平均 ~60 步而
+        # max_episode_length=600，取第一条会浪费 ~90% 的数据，且慢 5 倍。
+        # ---- 多评测 seed（与论文①② 口径一致：每格 N 个独立评测 seed，mean ± std）----
+        # 单次训练 + N 个独立评测 seed。每个 seed 是一次独立的确定性 rollout，
+        # 各 arm 用**同一组 seed**（共同随机数）⇒ 面对相同的初始条件与轨迹参数序列，
+        # 消掉这部分方差，arm 之间才可比。
+        n_seeds = int(cfg.get("p3_eval_seeds", 10))
+        n_ep = int(cfg.get("p3_eval_episodes", 2000))       # 每个 seed 的目标 episode 数
+        # 每批 = train_every 步(默认 64)。episode 上限 600 步 ⇒ 至少要 10 批
+        # 才可能有 episode 跑满结束；留足余量取 24。
+        max_b = int(cfg.get("p3_eval_max_batches", 24))     # 每个 seed 的 batch 上限
+        seed0 = int(cfg.get("p3_eval_seed", 12345))
+        logging.info(f"[paper3] deterministic eval: {n_seeds} 个评测 seed × "
+                     f"~{n_ep} episode (共同随机数, 基 seed={seed0}) ...")
+        base_env.eval(); env.eval()
+        t_eval = time.time()
+
+        # 用**独立的** collector 做评测：训练用的那个在训练循环 break 之后
+        # 迭代器状态已终止，再迭代会立刻返回空（实测每个 seed 只花 6 s、
+        # 收不到任何 episode）。评测批小一些(train_every//2)以便细粒度控制。
+        eval_fpb = env.num_envs * max(int(cfg.algo.train_every) // 2, 8)
+        # ⚠ marinegym 的 SyncDataCollector.iterator() 末尾是
+        #   `if self._frames >= self.total_frames: break`
+        #   传 -1 会在第 1 批之后立刻 break（只有 32 步，慢速轨迹下一条
+        #   episode 都结束不了）。必须给足额度：每个 seed 最多 max_b 批，
+        #   而 iterator() 每次 __iter__ 都把 _frames 归零，故按单 seed 算即可。
+        eval_collector = SyncDataCollector(
+            env, policy=policy, frames_per_batch=eval_fpb,
+            total_frames=eval_fpb * (max_b + 2),
+            device=cfg.sim.device, return_same_td=True,
+        )
+
+        per_seed = {}          # key -> [每个 seed 的均值]
+        total_ep = 0
+        for si in range(n_seeds):
+            env.set_seed(seed0 + si)
+            env.reset()
+            # ⚠ EpisodeStats.pop() 只清 _stats，**不重置 _episodes**（它从训练
+            # 开始就一直累加）。若用 _episodes 作停止判据，评测第一批之后就会
+            # 立刻满足 `>= n_ep` 而退出 —— 慢速轨迹下一条 episode 都收不到。
+            # 这里显式清零，并改用 len(episode_stats) 作判据。
+            episode_stats._stats.clear()
+            episode_stats._episodes = 0
+            _pw_seed = []
+            _nb = 0
+            with set_exploration_type(ExplorationType.MODE), torch.no_grad():
+                for bi, data in enumerate(eval_collector):
+                    _nb = bi + 1
+                    episode_stats.add(data.to_tensordict())
+                    _a = data.get(("agents", "action"), None)
+                    if _a is not None:
+                        _pw_seed.append(compute_avg_power(_a.cpu()))
+                    if len(episode_stats) >= n_ep or bi >= max_b:
+                        break
+            # 任务可跟踪时 episode 会跑满 max_episode_length(600 步)，
+            # 若批数不够则一条都不会结束 ⇒ pop() 会抛 "non-empty TensorList"。
+            # 这里显式跳过并告警，而不是让整个 run 崩掉。
+            logging.info(f"[paper3] 评测 seed {seed0+si}: 实际迭代 {_nb} 批, "
+                         f"累计 episode {len(episode_stats)}")
+            if len(episode_stats) == 0:
+                logging.warning(f"[paper3] 评测 seed {seed0+si}: {max_b} 批(每批 "
+                                f"{eval_fpb} frames)内无 episode 结束"
+                                f"。任务可能已可持续跟踪，请加大 p3_eval_max_batches。跳过该 seed。")
+                continue
+            total_ep += len(episode_stats)
+            st_i = episode_stats.pop()
+            row = {}
+            for k, v in st_i.items(True, True):
+                name = "eval/" + (".".join(k) if isinstance(k, tuple) else k)
+                row[name] = float(v.float().mean())
+
+            # ---- 派生指标（比原始 stats 更可读，也更适合当论文主指标）----
+            _el = st_i.get(("stats", "episode_len")).float().reshape(-1).clamp_min(1.0)
+            _te = st_i.get(("stats", "tracking_error")).float().reshape(-1)
+            # tracking_error 是逐步累加的 -distance ⇒ 平均跟踪误差(米) = -te/len
+            _tem = (-_te / _el)
+            row["eval/stats.tracking_err_mean_m"] = float(_tem.mean())
+            row["eval/stats.tracking_err_p90_m"] = float(_tem.quantile(0.90))
+            # 成功率：跑满时长而没有跟丢（episode 因跟踪失败提前终止）
+            _maxlen = float(base_env.max_episode_length)
+            row["eval/stats.success_rate"] = float((_el >= _maxlen * 0.99).float().mean())
+            row["eval/stats.episode_len_p50"] = float(_el.median())
+            row["eval/stats.episode_len_p10"] = float(_el.quantile(0.10))
+            # 能耗（AUV 上很关键）：本 seed 各 batch 的平均电功率
+            if _pw_seed:
+                row["eval/stats.avg_power_W"] = float(np.mean(_pw_seed))
+            for name, val in row.items():
+                per_seed.setdefault(name, []).append(val)
+
+        # 聚合：mean ± std **跨评测 seed**（n = n_seeds），与论文①② 一致
+        if not per_seed:
+            logging.error("[paper3] 所有评测 seed 都没有完整 episode —— "
+                          "p3_eval_max_batches 太小。不写结果。")
+            raise RuntimeError("eval collected zero episodes; increase p3_eval_max_batches")
+        agg = {}
+        for name, vals in per_seed.items():
+            a = np.asarray(vals, dtype=float)
+            agg[name] = {"mean": float(a.mean()), "std": float(a.std(ddof=1) if len(a) > 1 else 0.0),
+                         "n": len(a), "values": [float(x) for x in a]}
+        n_done = total_ep
+
+        # 发散检测：value_loss 爆掉 → NaN → 各指标全 0，会静默污染结果表。
+        # 显式标记，汇总脚本据此剔除并在论文里如实报告。
+        diverged = False
+        for c in p3_curve:
+            for k in ("policy_loss", "value_loss", "entropy"):
+                v = c.get(k)
+                if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+                    diverged = True
+        _el_agg = agg.get("eval/stats.episode_len", {})
+        if (not math.isfinite(_el_agg.get("mean", 1.0))) or _el_agg.get("mean", 1.0) <= 0.0:
+            diverged = True
+        if diverged:
+            logging.warning("[paper3] 该 run 训练发散(NaN/全零)，已标记 diverged=true")
+
+        rec = {
+            "diverged": diverged,
+            "arm": str(cfg.algo.encoder.get("name", "mlp")),
+            "encoder": getattr(policy, "encoder_cfg", None),
+            "context_len": int(cfg.task.get("context_len", 1)),
+            # 上游原始配置(TrackOrig)里没有 pomdp 段，get 会返回普通 dict，
+            # to_container 只吃 OmegaConf 对象 —— 必须容错，否则训练白跑。
+            "pomdp": (OmegaConf.to_container(cfg.task.pomdp, resolve=True)
+                      if "pomdp" in cfg.task and cfg.task.pomdp is not None else {}),
+            "seed": int(cfg.seed),
+            "total_frames": int(collector._frames),
+            "param_count": getattr(policy, "param_count", None),
+            "wandb_dir": getattr(run, "dir", None),      # 便于日后只重跑评测
+            "eval_seeds": [seed0 + i for i in range(n_seeds)],
+            "eval_protocol": (f"{n_seeds} independent eval seeds, common random "
+                              f"numbers across arms, deterministic (MODE)"),
+            "train_wall_s": time.time() - p3_t0,
+            "eval_wall_s": time.time() - t_eval,
+            "eval_episodes": n_done,
+            "eval": agg,
+            "curve": p3_curve,
+        }
+        os.makedirs(os.path.dirname(os.path.abspath(p3_out)), exist_ok=True)
+        with open(p3_out, "w") as f:
+            json.dump(rec, f, indent=1, default=str)
+        logging.info(f"[paper3] wrote {p3_out}  ({n_done} episodes)")
+        for k in ("eval/stats.episode_len", "eval/stats.return",
+                  "eval/stats.tracking_err_mean_m", "eval/stats.success_rate",
+                  "eval/stats.avg_power_W", "eval/stats.action_smoothness"):
+            if k in agg:
+                print(f"[paper3] {k}: {agg[k]['mean']:.4f} ± {agg[k]['std']:.4f}"
+                      f"  (n={agg[k]['n']})", flush=True)
 
     logging.info(f"Final Eval at {collector._frames} steps.")
     info = {"env_frames": collector._frames}

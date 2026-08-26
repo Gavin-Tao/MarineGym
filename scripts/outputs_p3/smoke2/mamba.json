@@ -1,0 +1,91 @@
+{
+ "arm": "mamba",
+ "encoder": {
+  "name": "mamba",
+  "d_model": 128,
+  "n_layers": 1,
+  "n_heads": 4,
+  "d_state": 16,
+  "d_conv": 4,
+  "expand": 2,
+  "max_len": 16
+ },
+ "context_len": 16,
+ "pomdp": {
+  "drop_linear_vel": true,
+  "drop_angular_vel": true,
+  "obs_delay": 0,
+  "sparse_pos_period": 1,
+  "obs_noise_std": 0.0,
+  "obs_dropout": 0.0
+ },
+ "seed": 0,
+ "total_frames": 4096,
+ "param_count": {
+  "actor": 156166,
+  "critic": 155649
+ },
+ "train_wall_s": 93.76449513435364,
+ "eval_wall_s": 30.534246683120728,
+ "eval_episodes": 166,
+ "eval": {
+  "eval/stats.stats.episode_len": {
+   "mean": 60.31034469604492,
+   "std": 8.43386459350586,
+   "n": 58
+  },
+  "eval/stats.stats.tracking_error_ema": {
+   "mean": 0.44275611639022827,
+   "std": 0.00851191021502018,
+   "n": 58
+  },
+  "eval/stats.stats.tracking_error": {
+   "mean": -11.607486724853516,
+   "std": 1.7447974681854248,
+   "n": 58
+  },
+  "eval/stats.stats.action_smoothness": {
+   "mean": 0.0,
+   "std": 0.0,
+   "n": 58
+  },
+  "eval/stats.stats.return": {
+   "mean": 51.395076751708984,
+   "std": 7.152292251586914,
+   "n": 58
+  }
+ },
+ "curve": [
+  {
+   "env_frames": 4096,
+   "rollout_fps": 162.23915912483307,
+   "entropy": 4.254138946533203,
+   "value_loss": 0.45595625042915344,
+   "actor_grad_norm": 6.088171005249023,
+   "explained_var": 0.2660779654979706,
+   "policy_loss": 0.00297827972099185,
+   "critic_grad_norm": 1.4060072898864746,
+   "train/stats.avg_power_W": 597.2050170898438,
+   "iter": 0,
+   "wall_s": 29.92481255531311
+  },
+  {
+   "env_frames": 8192,
+   "rollout_fps": 141.60624784713468,
+   "train/stats.episode_len": 60.046295166015625,
+   "train/stats.tracking_error_ema": 0.4420247972011566,
+   "train/stats.tracking_error": -11.52357292175293,
+   "train/stats.action_smoothness": 0.0,
+   "train/stats.return": 51.19672775268555,
+   "entropy": 4.2489166259765625,
+   "value_loss": 0.24975571036338806,
+   "actor_grad_norm": 5.164971351623535,
+   "explained_var": 0.6191131472587585,
+   "policy_loss": 0.0012870635837316513,
+   "critic_grad_norm": 1.898834228515625,
+   "train/stats.avg_power_W": 591.7964477539062,
+   "iter": 1,
+   "wall_s": 63.227731227874756
+  }
+ ]
+}

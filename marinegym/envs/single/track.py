@@ -111,6 +111,15 @@ class Track(IsaacEnv):
             self.field_enable = False
             self.dyn_enable = False
 
+        # --- 论文③：部分可观测化 + 观测历史窗口 ---
+        # 注意顺序：_set_specs() 是在 super().__init__() 内部调用的 (isaac_env.py:208)，
+        # 所以这两项必须先于 super().__init__() 解析好。
+        self.pomdp_cfg = cfg.task.get("pomdp", None)
+        self.context_len = int(cfg.task.get("context_len", 1))
+        # 窗口采样步长（帧跳）。62.5 Hz 下相邻帧差异仅 ~1%，stride>1 才提得出信号。
+        self.context_stride = int(cfg.task.get("context_stride", 1))
+        assert self.context_len >= 1 and self.context_stride >= 1
+
         super().__init__(cfg, headless)
 
         self.drone.initialize()
@@ -303,9 +312,81 @@ class Track(IsaacEnv):
         if self.risk_in_obs:
             obs_dim += 1  # component A: predicted-risk scalar (one step delayed)
 
+        # --- 论文③：观测分量切片表 ---
+        # 观测拼装顺序见 _compute_state_and_obs：
+        #   rpos(3*K) | quat(4) | lin_vel(3) | ang_vel(3) | heading(3) | up(3) | throttle(n_act) | ...
+        # 其中 drone_state = [pos(3), rot(4), vel(6), heading(3), up(3), throttle(n_act)]
+        # 而 obs 用 rpos 取代了 pos，即拼的是 drone_state[..., 3:]。
+        _K = self.future_traj_steps
+        _n_act = drone_state_dim - 19          # rotors + fins
+        _b = 3 * _K
+        self._obs_slices = {
+            "rpos":     (0, _b),
+            "quat":     (_b,      _b + 4),
+            "lin_vel":  (_b + 4,  _b + 7),
+            "ang_vel":  (_b + 7,  _b + 10),
+            "heading":  (_b + 10, _b + 13),
+            "up":       (_b + 13, _b + 16),
+            "throttle": (_b + 16, _b + 16 + _n_act),
+            # 当前参考点(rpos[0]) 与 未来参考点(rpos[1:]) 分开，
+            # 因为"是否告知未来"决定了任务是不是前馈主导的
+            "rpos_now": (0, 3),
+            "rpos_future": (3, _b),
+        }
+        # time_encoding 紧跟在 keepout/risk(此处均关) 之后
+        if self.time_encoding:
+            _te0 = _b + 16 + _n_act
+            self._obs_slices["time_enc"] = (_te0, _te0 + self.time_encoding_dim)
+        from marinegym.envs.utils.pomdp import (ObsDegrader, ObsHistory,
+                                                ActuatorDrift, WaveDisturbance)
+        # ---- 论文③ oracle 对照：把未观测的执行器增益显式喂给策略 ----
+        # drift(不可见) vs drift_oracle(可见) 构成一对**动力学完全相同、
+        # 任务难度完全相同、唯一差别是信息**的对照，是最干净的 POMDP 论证。
+        _pc = self.pomdp_cfg
+        _gr = (_pc.get("thrust_gain_range", None) if _pc is not None else None)
+        self.gain_in_obs = bool(
+            _gr is not None and list(_gr) != [1.0, 1.0]
+            and (_pc.get("thrust_gain_in_obs", False) if _pc is not None else False))
+        if self.gain_in_obs:
+            _per_ch = (_pc.get("thrust_gain_per_channel", True)
+                       if _pc is not None else True)
+            obs_dim += (self.drone.action_spec.shape[-1] if _per_ch else 1)
+
+        # ---- accel oracle ----
+        # 水下载具的附加质量力依赖**加速度**，而观测里只有位置/速度/姿态/油门，
+        # 没有加速度 —— 加速度只能对速度做时间差分得到，这是 Track 任务
+        # **固有的**部分可观测性（与人为加的增益漂移无关）。
+        # 打开本项 = 把加速度白送给策略，用来验证"序列模型的优势是否来自恢复加速度"。
+        self.accel_in_obs = bool(_pc.get("accel_in_obs", False)) if _pc is not None else False
+        if self.accel_in_obs:
+            obs_dim += 6
+        self._prev_vel = torch.zeros(self.num_envs, 1, 6, device=self.device)
+        self._degrader = ObsDegrader(
+            self.pomdp_cfg, self.num_envs, obs_dim, self._obs_slices, self.device)
+        self._history = ObsHistory(self.num_envs, self.context_len, obs_dim, self.device,
+                                   stride=self.context_stride)
+        self._drift = ActuatorDrift(self.pomdp_cfg, self.num_envs,
+                                    self.drone.action_spec.shape[-1], self.device)
+        # 未观测的周期扰动（涌浪）：理论上保证需要历史才能前馈抵消
+        self._wave = WaveDisturbance(self.pomdp_cfg, self.num_envs,
+                                     self.drone.action_spec.shape[-1], self.device)
+        # episode 重置后，历史窗口需要用重置后的第一帧填满（而不是补零）
+        self._pomdp_refill = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
+        if self._degrader.enabled or self.context_len > 1:
+            import logging
+            logging.info(f"[paper3] obs_dim={obs_dim} context_len={self.context_len} "
+                         f"stride={self.context_stride} span={(self.context_len-1)*self.context_stride+1}步 "
+                         f"pomdp={{drop_lin={self._degrader.drop_linear_vel}, "
+                         f"drop_ang={self._degrader.drop_angular_vel}, "
+                         f"delay={self._degrader.obs_delay}, "
+                         f"sparse={self._degrader.sparse_pos_period}, "
+                         f"noise={self._degrader.obs_noise_std}, "
+                         f"dropout={self._degrader.obs_dropout}}}")
+
+        # 观测统一为 3 维 (n_agents, L, obs_dim)，L=1 时退化为"只看当前帧"
         self.observation_spec = CompositeSpec({
             "agents": {
-                "observation": UnboundedContinuousTensorSpec((1, obs_dim))
+                "observation": UnboundedContinuousTensorSpec((1, self.context_len, obs_dim))
             }
         }).expand(self.num_envs).to(self.device)
         self.action_spec = CompositeSpec({
@@ -388,6 +469,15 @@ class Track(IsaacEnv):
         return obstacle
 
     def _reset_idx(self, env_ids: torch.Tensor):
+        # 论文③：这些 env 的历史窗口/退化 buffer 需要用重置后的第一帧重填
+        if hasattr(self, "_pomdp_refill"):
+            self._pomdp_refill[env_ids] = True
+        if hasattr(self, "_drift"):
+            self._drift.reset(env_ids)          # 逐 episode 重采样执行器增益
+        if hasattr(self, "_wave"):
+            self._wave.reset(env_ids)           # 逐 episode 重采样扰动 (A, ω, φ)
+        if hasattr(self, "_prev_vel"):
+            self._prev_vel[env_ids] = 0.        # 差分基准清零，避免跨 episode 串味
         if self.enable_flow:
             self.drone.set_flow_velocities(env_ids, self.max_flow_velocity, self.flow_velocity_gaussian_noise)
         self.drone._reset_idx(env_ids)
@@ -532,6 +622,11 @@ class Track(IsaacEnv):
             self._val_rpm = self.drone.rotor_params["rpm"].clone()
             self._val_vprev = self.drone.prev_body_vels.clone()
             self._val_aprev = self.drone.prev_body_acc.clone()
+        # 论文③ 兜底 POMDP：未观测的执行器增益（在最终施加前乘上去，
+        # 策略与所有下游指标都看不到它）
+        actions = self._drift(actions)
+        # 周期扰动按 episode 内的绝对时间施加（相位随时间推进）
+        actions = self._wave(actions, self.progress_buf * self.dt)
         self.effort = torch.abs(self.drone.apply_action(actions))
 
         if self.wind:
@@ -621,7 +716,34 @@ class Track(IsaacEnv):
         if self.intrinsics:
             obs.append(self.drone.get_info())
 
+        if self.accel_in_obs:
+            # a = (v_t - v_{t-1}) / dt，除以 10 做粗归一（AUV 加速度量级 ~m/s²）
+            _v = self.drone_state[..., 7:13]
+            _a = (_v - self._prev_vel) / max(self.dt, 1e-6) / 10.0
+            obs.append(_a)
+        # 无论是否进观测都要更新，供下一步差分
+        self._prev_vel = self.drone_state[..., 7:13].clone()
+
+        if self.gain_in_obs:
+            # 归一到 [-1,1]，量纲与其它观测一致。放在末尾，不影响已算好的观测切片。
+            _g = self._drift.gain
+            _gn = (_g - self._drift.lo) / max(self._drift.hi - self._drift.lo, 1e-6) * 2.0 - 1.0
+            obs.append(_gn.unsqueeze(1))                     # [E,1,A]
+
         obs = torch.cat(obs, dim=-1)
+
+        # --- 论文③：POMDP 退化 + 历史窗口  [E,1,D] → [E,1,L,D] ---
+        # 退化在观测出口施加，物理仿真完全不动；各 arm 看到同一个退化后的观测流，
+        # 差别只在编码器 —— 这样"增益来自历史信息"才是干净的因果结论。
+        obs_flat = obs.squeeze(1)                                   # [E, D]
+        _refill = self._pomdp_refill.nonzero(as_tuple=True)[0]
+        if _refill.numel() > 0:
+            self._degrader.reset(_refill, obs_flat)
+        obs_flat = self._degrader(obs_flat, self.progress_buf)
+        if _refill.numel() > 0:
+            self._history.reset(_refill, obs_flat)
+            self._pomdp_refill[_refill] = False
+        obs = self._history.push(obs_flat).unsqueeze(1)             # [E, 1, L, D]
 
         if self.keepout_enable:
             # update safety metrics for ALL obstacles

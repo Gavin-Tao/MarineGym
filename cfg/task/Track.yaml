@@ -31,6 +31,41 @@ traj_w_range: [0.7, 0.9] # 轨迹角速度区间；参考线速度 ∝ traj_scal
 
 action_transform: null
 
+# ===== 论文③ (mamba)：部分可观测化 + 观测历史窗口 =====
+# 默认全关 ⇒ 与改造前完全一致的全观测 MDP（context_len=1 时 obs 只是多了一个长度为 1
+# 的时间轴，mlp 编码器取末位，数值上等价）。
+context_len: 1          # 观测历史窗口长度 L；1 = 只看当前帧
+# 窗口采样步长(帧跳)。控制频率 62.5 Hz 下相邻帧相对差异仅 ~1%，
+# stride=1 的窗口信噪比极差；stride=k 让窗口跨越 (L-1)*k+1 步。
+context_stride: 1
+pomdp:
+  drop_linear_vel: false    # DVL 失效：屏蔽线速度(3维)  ← 主实验用这个
+  drop_angular_vel: false   # 陀螺失效：屏蔽角速度(3维)  ← 主实验用这个
+  obs_delay: 0              # 声学链路延迟(步)
+  sparse_pos_period: 1      # USBL 稀疏定位：位置类观测每 k 步才刷新(1=每步)
+  obs_noise_std: 0.0        # 观测高斯噪声
+  obs_dropout: 0.0          # 丢包概率(沿用上一帧)
+  # 切断前馈通道：观测里原本给了未来 4 个参考点 + 时间编码，
+  # 等于把"参考接下来去哪"抄给策略 ⇒ 任务前馈主导，单帧就够。
+  drop_future_ref: false    # 只保留当前参考点，屏蔽未来 3 个
+  drop_time_encoding: false # 屏蔽时间编码(否则可由相位反推参考运动)
+  # 未观测的周期扰动(涌浪诱导力)。理论上保证需要历史：
+  # 反应式控制永远滞后半个周期，要抵消必须从历史估计 (A, ω, φ) 做前馈。
+  wave_amp: 0.0             # 幅值(动作量程 [-1,1] 的比例)，0=关闭
+  wave_freq_range: [2.0, 8.0]  # 角频率 rad/s (周期 0.8-3.1 s)
+  wave_per_channel: true
+  # 兜底档：未观测的逐 episode 执行器增益(生物附着/电压下降/标定漂移)。
+  # null 或 [1.0,1.0] = 关闭。策略无法从单帧得知增益，必须在线辨识。
+  thrust_gain_range: null   # 例如 [0.5, 1.0]
+  thrust_gain_per_channel: true
+  # oracle 对照：true = 把增益直接喂给策略(退化为 MDP)，用来证明
+  # "差距来自信息缺失，而不是任务变难了"
+  thrust_gain_in_obs: false
+  # accel oracle：把 (v_t - v_{t-1})/dt 直接喂给策略。
+  # 用于验证"序列模型的优势是否来自恢复加速度"——若开启后优势消失，机制即被证实。
+  accel_in_obs: false
+
+
 # keep-out obstacle (safe-RL paper; default off, enable with +task.keepout.enable=true)
 keepout:
   enable: false
