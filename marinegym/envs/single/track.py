@@ -602,7 +602,7 @@ class Track(IsaacEnv):
             self._cor_prev = None
 
     # ── 论文②：阵风 ───────────────────────────────────────────────────────
-    def _launch_gust(self, env_ids, mask):
+    def _launch_gust(self, env_ids, mask, now=None):
         """给 env_ids[mask] 发一阵新风。
 
         瞄准策略 curvature：阵风的**峰值时刻**对准参考轨迹在受限轴上的极值点 ——
@@ -625,6 +625,11 @@ class Track(IsaacEnv):
         self._gust_ramp[idx] = ramp
         self._gust_hold[idx] = ((torch.rand(n, 1, device=self.device, generator=self._gust_gen) * (h_hi - h_lo) + h_lo) / self.dt).round().clamp_min(1)
 
+        # reset 路径上 progress_buf 还是上一 episode 的末值，而 _compute_traj 以它为基准 ——
+        # 不先清零的话，瞄准的是轨迹上**错误的相位**，方向（正/负侧）可能整个取反。
+        # IsaacEnv 在 _reset_idx 返回后 2 行就会做同样的清零，提前做是安全的。
+        if now is not None and float(now) == 0.0:
+            self.progress_buf[idx] = 0
         # 在 lookahead 窗口内找参考轨迹在受限轴上 |偏移| 最大的那一步
         k_lo, k_hi = self.gust_lookahead
         traj = self._compute_traj(int(k_hi) + 1, idx, step_size=1.)          # [n,K,3]
@@ -636,7 +641,15 @@ class Track(IsaacEnv):
         side = torch.where(side == 0, torch.ones_like(side), side)
         self._gust_amp[idx] = amp * side
         # 让上升沿恰好在 k_peak 处走完 → 峰值与参考极值点对齐
-        now = self.progress_buf[idx].unsqueeze(-1).float()
+        # `now` 必须是**该 episode 的当前步**。在 reset 路径上不能直接读 progress_buf ——
+        # IsaacEnv 是先 `_reset_idx(env_ids)` 再 `progress_buf[env_ids] = 0`
+        # (isaac_env.py:275/277)，此刻读到的还是上一 episode 的末值(≈599)，
+        # 于是 _gust_t0 / _gust_next 被排到新 episode 永远追不上的未来，
+        # **整个 episode 一次阵风都不会发**。只有最初那次 reset（progress_buf 本就是 0）正常。
+        # 后果：长时间训练里绝大多数 episode 实际是无扰动的，而短评测大多是第一个 episode
+        # 反而有扰动 —— 训练与评测的任务因此根本不同。
+        now = (self.progress_buf[idx].unsqueeze(-1).float() if now is None
+               else torch.zeros(n, 1, device=self.device) + float(now))
         self._gust_t0[idx] = now + (k_peak.unsqueeze(-1).float() - ramp).clamp_min(0.)
         self._gust_next[idx] = now + self.gust_period      # 下一次重发的时刻（从本次发射算起）
 
@@ -699,7 +712,9 @@ class Track(IsaacEnv):
         if self.corridor_enable:
             self._reset_corridor(env_ids)
         if self.gust_enable:
-            self._launch_gust(env_ids, torch.ones(len(env_ids), dtype=torch.bool, device=self.device))
+            # reset 路径显式传 now=0：progress_buf 要到本函数返回之后才被清零
+            self._launch_gust(env_ids, torch.ones(len(env_ids), dtype=torch.bool, device=self.device),
+                              now=0.0)
 
         if self.keepout_enable:
             # place N_OBSTACLES on the tracked reference (so a tracking policy must avoid them)

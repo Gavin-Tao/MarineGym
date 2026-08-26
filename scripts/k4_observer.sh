@@ -11,7 +11,11 @@ OUT=/home/jovyan/MarineGym-flow/scripts/outputs_flow/k4
 mkdir -p "$OUT"
 STEPS=${STEPS:-300}
 H=${H:-15}
-${GPU:+CUDA_VISIBLE_DEVICES=$GPU} timeout 1800 bash /home/jovyan/MarineGym-flow/scripts/run_flow.sh train.py \
+# 显式指定 GPU 时用 export，**不能**写成 `${GPU:+CUDA_VISIBLE_DEVICES=$GPU} cmd`：
+# 变量赋值前缀必须是字面量，由参数展开产生的会被 bash 当成命令名执行，报
+# "CUDA_VISIBLE_DEVICES=2: command not found" 并且**返回 0**，整格静默跳过。
+[ -n "${GPU:-}" ] && export CUDA_VISIBLE_DEVICES="$GPU"
+timeout 1800 bash /home/jovyan/MarineGym-flow/scripts/run_flow.sh train.py \
   task=Track algo=ppo task.drone_model.name=BlueROV \
   headless=true enable_livestream=false wandb.mode=offline seed=0 \
   task.env.num_envs=${K4_ENVS:-32} \

@@ -71,7 +71,11 @@ mkdir -p "$OUT$SUF"
 LOG="$OUT$SUF/${CELL}__${SCENE}__s${SEED}.log"
 if grep -q 'EVAL-ONLY RESULTS' "$LOG" 2>/dev/null; then echo "[skip] $CELL/$SCENE/s$SEED 已完成"; exit 0; fi
 echo "[$(date '+%H:%M:%S')] eval $CELL / $SCENE / s$SEED"
-${GPU:+CUDA_VISIBLE_DEVICES=$GPU} timeout ${TIMEOUT:-5400} bash "$R" train.py $BASE $SC $CF \
+# 显式指定 GPU 时用 export，**不能**写成 `${GPU:+CUDA_VISIBLE_DEVICES=$GPU} cmd`：
+# 变量赋值前缀必须是字面量，由参数展开产生的会被 bash 当成命令名执行，报
+# "CUDA_VISIBLE_DEVICES=2: command not found" 并且**返回 0**，整格静默跳过。
+[ -n "${GPU:-}" ] && export CUDA_VISIBLE_DEVICES="$GPU"
+timeout ${TIMEOUT:-5400} bash "$R" train.py $BASE $SC $CF \
   +ep_dump="${LOG%.log}.episodes.csv" > "$LOG" 2>&1
 echo "[$(date '+%H:%M:%S')] rc=$?"
 sed -n '/EVAL-ONLY RESULTS/,$p' "$LOG" | head -25

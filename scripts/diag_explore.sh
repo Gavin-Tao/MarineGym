@@ -16,7 +16,7 @@ R=/home/jovyan/MarineGym-flow/scripts/run_flow.sh
 BASE="task=Track algo=ppo task.drone_model.name=BlueROV \
 headless=true enable_livestream=false wandb.mode=offline \
 eval_only=true eval_episodes=500 +eval_max_batches=12 \
-task.env.num_envs=128 seed=0 load_ckpt=$CKPT \
+task.env.num_envs=${NUM_ENVS:-32} seed=0 load_ckpt=$CKPT \
 task.corridor.enable=true task.gust.enable=true \
 task.safety.risk.enable=false task.safety.mppi.enable=false"
 

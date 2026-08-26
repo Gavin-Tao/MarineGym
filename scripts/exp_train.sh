@@ -40,6 +40,10 @@ esac
 
 LOG="$OUT/${CELL}_s${SEED}.log"
 echo "[$(date '+%H:%M:%S')] 训练 $CELL seed=$SEED → $LOG"
-${GPU:+CUDA_VISIBLE_DEVICES=$GPU} timeout ${TIMEOUT:-36000} bash "$R" train.py $COMMON $EXTRA > "$LOG" 2>&1
+# 显式指定 GPU 时用 export，**不能**写成 `${GPU:+CUDA_VISIBLE_DEVICES=$GPU} cmd`：
+# 变量赋值前缀必须是字面量，由参数展开产生的会被 bash 当成命令名执行，报
+# "CUDA_VISIBLE_DEVICES=2: command not found" 并且**返回 0**，整格静默跳过。
+[ -n "${GPU:-}" ] && export CUDA_VISIBLE_DEVICES="$GPU"
+timeout ${TIMEOUT:-36000} bash "$R" train.py $COMMON $EXTRA > "$LOG" 2>&1
 echo "[$(date '+%H:%M:%S')] $CELL s$SEED rc=$?"
 grep -E "^\s+(wall_violation|tracking_error_ema|episode_len|return):" "$LOG" | tail -8
