@@ -336,6 +336,12 @@ class Track(IsaacEnv):
             self._gust_ramp = torch.ones(E, 1, device=self.device)        # 上升步数
             self._gust_hold = torch.ones(E, 1, device=self.device)        # 保持步数
             self._gust_next = torch.zeros(E, 1, device=self.device)       # 下次重发的步（独立计时）
+            # 阵风用**独立的 generator**，不走全局 RNG。否则 MPPI 的 torch.randn 会
+            # 消耗全局流，含滤波器的格子与 PPO 格子遇到的阵风序列就不同 —— 50 个
+            # episode 下几个百分点的违约率差可能纯粹来自扰动采样差异。独立发生器让
+            # 各格面对完全相同的扰动序列，消融变成配对比较。
+            self._gust_gen = torch.Generator(device=self.device)
+            self._gust_gen.manual_seed(int(self.cfg.get("seed", 0)) * 100003 + 7919)
         if self.corridor_enable and (self.dobs_enable or self.cor_risk_enable or self.cor_mppi_enable):
             from marinegym.utils.nominal_dynamics import NominalDynamics
             _dt = self.dt * int(self.cfg.sim.get("substeps", 1))
@@ -588,12 +594,12 @@ class Track(IsaacEnv):
             return
         n = idx.numel()
         lo, hi = self.gust_speed
-        amp = torch.rand(n, 1, device=self.device) * (hi - lo) + lo
+        amp = torch.rand(n, 1, device=self.device, generator=self._gust_gen) * (hi - lo) + lo
         r_lo, r_hi = self.gust_ramp
         h_lo, h_hi = self.gust_hold
-        ramp = ((torch.rand(n, 1, device=self.device) * (r_hi - r_lo) + r_lo) / self.dt).round().clamp_min(1)
+        ramp = ((torch.rand(n, 1, device=self.device, generator=self._gust_gen) * (r_hi - r_lo) + r_lo) / self.dt).round().clamp_min(1)
         self._gust_ramp[idx] = ramp
-        self._gust_hold[idx] = ((torch.rand(n, 1, device=self.device) * (h_hi - h_lo) + h_lo) / self.dt).round().clamp_min(1)
+        self._gust_hold[idx] = ((torch.rand(n, 1, device=self.device, generator=self._gust_gen) * (h_hi - h_lo) + h_lo) / self.dt).round().clamp_min(1)
 
         # 在 lookahead 窗口内找参考轨迹在受限轴上 |偏移| 最大的那一步
         k_lo, k_hi = self.gust_lookahead
