@@ -16,10 +16,12 @@ ${GPU:+CUDA_VISIBLE_DEVICES=$GPU} timeout 1800 bash /home/jovyan/MarineGym-flow/
   headless=true enable_livestream=false wandb.mode=offline seed=0 \
   task.env.num_envs=${K4_ENVS:-32} \
   task.corridor.enable=true task.gust.enable=true \
+  task.gust.speed=[${GSPEED:-0.6,1.0}] task.gust.ramp=[${GRAMP:-0.2,0.5}] \
   task.safety.risk.enable=true task.safety.mppi.enable=false \
   task.safety.risk.horizon=$H task.safety.k4=true \
-  +save_traj="$OUT/k4.npz" +traj_steps=$STEPS \
-  > "$OUT/k4.log" 2>&1
+  task.safety.dobs.alpha=${ALPHA:-0.1} \
+  +save_traj="$OUT/k4${TAG:+_$TAG}.npz" +traj_steps=$STEPS \
+  > "$OUT/k4${TAG:+_$TAG}.log" 2>&1
 echo "capture rc=$?"
 /home/jovyan/envs/sim/bin/python /home/jovyan/MarineGym-flow/scripts/flow_validate.py \
-  k4 --npz "$OUT/k4.npz" --horizon $H
+  k4 --npz "$OUT/k4${TAG:+_$TAG}.npz" --horizon $H
