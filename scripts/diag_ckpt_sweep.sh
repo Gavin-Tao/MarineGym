@@ -11,7 +11,8 @@ OUT=/home/jovyan/MarineGym-flow/scripts/outputs_flow/diag
 mkdir -p "$OUT"
 R=/home/jovyan/MarineGym-flow/scripts/run_flow.sh
 
-for fr in ${FRAMES:-"827392 1703936 3407872 4104192"}; do
+FRAMES=${FRAMES:-827392 1703936 3407872 4104192}
+for fr in $FRAMES; do
   CK="$D/checkpoint_${fr}.pt"
   [ -f "$CK" ] || { echo "缺 $CK"; continue; }
   LOG="$OUT/ck_${fr}.log"
