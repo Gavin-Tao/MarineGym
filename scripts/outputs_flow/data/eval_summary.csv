@@ -1,4 +1,17 @@
 cell,scene,stats.wall_violation__mean,stats.wall_violation__std,stats.wall_violation__count,stats.wall_viol_frac__mean,stats.wall_viol_frac__std,stats.wall_viol_frac__count,stats.wall_depth__mean,stats.wall_depth__std,stats.wall_depth__count,stats.min_wall_dist__mean,stats.min_wall_dist__std,stats.min_wall_dist__count,stats.tracking_error_ema__mean,stats.tracking_error_ema__std,stats.tracking_error_ema__count,stats.filter_lambda__mean,stats.filter_lambda__std,stats.filter_lambda__count,stats.episode_len__mean,stats.episode_len__std,stats.episode_len__count
 ppo,calm,0.053,,1,0.053,,1,0.0242,,1,0.7206,,1,0.3408,,1,0.0,,1,575.9015,,1
+ppo,nominal,0.2132,,1,0.1773,,1,0.0956,,1,0.3975,,1,1.1834,,1,0.0,,1,500.3603,,1
+ppo,strong,0.5751,,1,0.514,,1,0.2029,,1,-0.2176,,1,2.5708,,1,0.0,,1,361.0984,,1
+ppo,fast,0.6113,,1,0.5095,,1,0.1542,,1,-0.1748,,1,2.6263,,1,0.0,,1,293.682,,1
 mpc_only,calm,0.0,,1,0.0,,1,0.0,,1,0.7486,,1,0.9269,,1,1.0,,1,598.0,,1
+mpc_only,nominal,0.0,,1,0.0,,1,0.0,,1,0.3558,,1,1.2851,,1,1.0,,1,598.0,,1
+mpc_only,strong,0.9706,,1,0.6177,,1,0.4526,,1,-0.462,,1,1.9502,,1,1.0,,1,571.9485,,1
+mpc_only,fast,1.0,,1,0.5723,,1,0.3161,,1,-0.4041,,1,1.9069,,1,1.0,,1,568.4348,,1
 react_soft,calm,0.053,,1,0.053,,1,0.0266,,1,0.721,,1,0.3413,,1,0.0557,,1,575.4318,,1
+react_soft,nominal,0.2148,,1,0.1836,,1,0.0947,,1,0.3783,,1,1.2133,,1,0.225,,1,500.8148,,1
+react_soft,strong,0.6469,,1,0.5828,,1,0.1752,,1,-0.2412,,1,2.7085,,1,0.69,,1,266.275,,1
+react_soft,fast,0.6068,,1,0.5036,,1,0.168,,1,-0.176,,1,2.6273,,1,0.628,,1,286.6712,,1
+ours,calm,0.0448,,1,0.044,,1,0.0238,,1,0.7206,,1,0.39,,1,0.0652,,1,567.7687,,1
+ours,nominal,0.2029,,1,0.1789,,1,0.0991,,1,0.3803,,1,1.1994,,1,0.2573,,1,497.0507,,1
+ours,strong,0.6051,,1,0.4788,,1,0.1842,,1,-0.1676,,1,2.4867,,1,0.6774,,1,375.3641,,1
+ours,fast,0.6184,,1,0.4798,,1,0.1327,,1,-0.1414,,1,2.6581,,1,0.6554,,1,290.159,,1
