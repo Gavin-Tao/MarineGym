@@ -7,7 +7,8 @@ defaults:
   - randomization@_here_ # Include the randomization settings
   - disturbances@_here_ # Include the disturbance settings
 env:
-  num_envs: 16
+  num_envs: 4096           # 上游预期规模。曾被调试遗留的 16 静默覆盖(bug,2026-08-26 修正)。
+                           # 共享 GPU 显存紧张时用命令行 task.env.num_envs=... 显式调小。
   max_episode_length: 600
 
 drone_model:
