@@ -43,3 +43,8 @@ echo "==== 第二批（补完消融矩阵）===="
 run_stage "$STAGE2_CELLS"
 $PY "$S/flow_collect.py" --dir "$EVDIR"
 $PY "$S/flow_report.py"
+echo
+echo "==== 显著性检验（各格 vs ours）===="
+# 统计功效提示：n≈68 时只够分辨 ~0.2 量级的违约率差（strong 档够用）；
+# nominal 档若要分辨 ~0.10 的差，每格需要约 250 个 episode，见 RESULTS.md 的说明。
+$PY "$S/flow_significance.py" --dir "$EVDIR" || echo "(逐 episode 数据不全，跳过)"

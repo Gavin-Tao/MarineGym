@@ -71,6 +71,7 @@ mkdir -p "$OUT$SUF"
 LOG="$OUT$SUF/${CELL}__${SCENE}__s${SEED}.log"
 if grep -q 'EVAL-ONLY RESULTS' "$LOG" 2>/dev/null; then echo "[skip] $CELL/$SCENE/s$SEED 已完成"; exit 0; fi
 echo "[$(date '+%H:%M:%S')] eval $CELL / $SCENE / s$SEED"
-${GPU:+CUDA_VISIBLE_DEVICES=$GPU} timeout ${TIMEOUT:-5400} bash "$R" train.py $BASE $SC $CF > "$LOG" 2>&1
+${GPU:+CUDA_VISIBLE_DEVICES=$GPU} timeout ${TIMEOUT:-5400} bash "$R" train.py $BASE $SC $CF \
+  +ep_dump="${LOG%.log}.episodes.csv" > "$LOG" 2>&1
 echo "[$(date '+%H:%M:%S')] rc=$?"
 sed -n '/EVAL-ONLY RESULTS/,$p' "$LOG" | head -25

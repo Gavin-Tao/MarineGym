@@ -287,6 +287,26 @@ def main(cfg):
                 if episode_stats._episodes >= n_eval_ep or bi >= max_batches:
                     break
         stats = episode_stats.pop()
+        # 论文②：逐 episode 值落盘。各消融格面对完全相同的扰动序列（阵风有独立 RNG），
+        # 所以可以做**配对**显著性检验，统计功效远高于只比均值。纯追加输出，
+        # 不参与任何计算，包 try/except 以免影响评测本身。
+        _ed = cfg.get("ep_dump", None)
+        if _ed:
+            try:
+                import csv as _csv
+                _cols, _vals = [], []
+                for k, v in stats.items(True, True):
+                    _cols.append(".".join(k) if isinstance(k, tuple) else k)
+                    _vals.append(v.float().reshape(-1).cpu().tolist())
+                _n = min(len(x) for x in _vals) if _vals else 0
+                with open(_ed, "w", newline="") as _f:
+                    _w = _csv.writer(_f)
+                    _w.writerow(_cols)
+                    for _i in range(_n):
+                        _w.writerow([x[_i] for x in _vals])
+                logging.info(f"EP-DUMP: {_n} episodes → {_ed}")
+            except Exception as _ex:
+                logging.warning(f"EP-DUMP 失败（不影响评测结果）: {_ex}")
         agg = {(".".join(k) if isinstance(k, tuple) else k): v.float().mean().item()
                for k, v in stats.items(True, True)}
         print(f"=== EVAL-ONLY RESULTS (episodes={episode_stats._episodes}) ===", flush=True)

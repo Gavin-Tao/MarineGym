@@ -62,5 +62,22 @@
 
 2. **闭环前滚（更彻底的修法）**：前滚时**重新查询策略**而不是零阶保持，
    让预测反映闭环行为。届时 oracle 应当成为最优、est 次之、d̂=0 最差 —— 消融
-   变得可解释，方法也更强。代价是每控制步 H 次策略前向（H=15，小 MLP，可承受），
-   实现上需要在前滚中重建观测向量（未来参考点、姿态、速度、走廊裕度、流速）。
+   变得可解释，方法也更强。代价是每控制步 H 次策略前向（H=15，小 MLP，可承受）。
+
+### 闭环前滚的实现要点（已核对，待矩阵跑完后落地）
+
+观测向量的拼接顺序必须与 `_compute_state_and_obs` **逐项一致**。当前配置
+（keepout 关、risk_in_obs 关、cor_in_obs 开、flow_in_obs 开）下是：
+
+| 段 | 维度 | 前滚中怎么算 |
+|---|---|---|
+| `rpos.flatten(1)` | `future_traj_steps×3` = 12 | 预先用 `_compute_traj(H+future_steps)` 取一次未来参考，逐步切片减去预测位置 |
+| `drone_state[...,3:]` | quat4+vel6+heading3+up3+throttle6 = 22 | quat/heading/up 在名义模型里恒定（不积分姿态）；`vel_w = R(q)·vel_b`；throttle 由 `t200_step` 积分，都在前滚状态 `s` 里 |
+| 走廊两侧裕度 | 2 | 由预测位置直接算 |
+| 流速分量 | 1 | **沿用当前值零阶保持**。虽然阵风剖面在仿真里是解析可知的，但用未来真值等于作弊 —— 真实 AUV 不知道未来海流 |
+| time encoding | 4 | `(progress+k)/max_episode_length` 广播 |
+
+合计 41 维，与训练时一致。
+
+注意 `_compute_traj` 以 `self.progress_buf` 为基准，前滚里需要按 k 偏移取切片
+（不要在循环里反复调用它）。
