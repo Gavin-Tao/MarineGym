@@ -210,6 +210,86 @@ def fig_training(out):
     return finalize(fig, out)
 
 
+def fig_calibration(out):
+    """图7：违约率 vs 阵风幅值（场景标定扫描）。
+
+    这张图有两个作用：说明各档 OOD 的难度是怎么定的（不是拍脑袋），
+    以及给出纯 PPO 的失效曲线 —— 违约率随扰动强度单调上升并在 ~2.2 m/s 饱和。
+    """
+    import re
+    files = sorted((ROOT / "calib").glob("ppo__v*.log"))
+    if not files:
+        return []
+    xs, ys, rm = [], [], []
+    for f in files:
+        txt = f.read_text(errors="replace")
+        i = txt.rfind("=== EVAL-ONLY RESULTS")
+        if i < 0:
+            continue
+        tail = txt[i:]
+        g = lambda k: (float(m.group(1)) if (m := re.search(rf"{re.escape(k)}:\s*(-?[\d.]+)", tail)) else np.nan)
+        lo, hi = f.stem[5:].lstrip("v").split("_")   # ppo__v0.6_1.0 → 0.6, 1.0
+        xs.append((float(lo) + float(hi)) / 2)
+        ys.append(g("stats.wall_violation"))
+        rm.append(g("stats.tracking_error_ema"))
+    if len(xs) < 2:
+        return []
+    o = np.argsort(xs)
+    xs, ys, rm = np.array(xs)[o], np.array(ys)[o], np.array(rm)[o]
+    fig, ax = plt.subplots(figsize=(5.6, 3.9))
+    ax.plot(xs, ys, "o-", lw=2.4, ms=8, color=PALETTE["red_strong"], label="Violation rate")
+    ax.set_xlabel("Gust amplitude, mid-range (m/s)")
+    ax.set_ylabel("Wall-violation rate ↓", color=PALETTE["red_strong"])
+    ax.set_ylim(-0.03, 1.18)          # 顶部留白给档位标注
+    ax.set_xlim(xs.min() - 0.35, xs.max() + 0.2)
+    # 标出实验用的三档（训练分布 + 两个 OOD），说明档位不是随手挑的
+    for xv, lab, ha in ((0.8, "nominal\n(train)", "left"), (1.85, "strong / fast\n(OOD)", "center")):
+        ax.axvline(xv, color="0.55", ls="--", lw=1.2)
+        ax.annotate(lab, (xv, 1.16), fontsize=9, color="0.35", ha=ha, va="top",
+                    xytext=(3 if ha == "left" else 0, 0), textcoords="offset points")
+    ax2 = ax.twinx()
+    ax2.plot(xs, rm, "s--", lw=1.8, ms=6, color=PALETTE["blue_main"], label="Tracking RMSE")
+    ax2.set_ylabel("Tracking RMSE (m)", color=PALETTE["blue_main"])
+    ax2.grid(False)
+    return finalize(fig, out)
+
+
+def fig_k4(out):
+    """图8：K4 —— 三种 d̂ 下的预测门控质量（MAE 与门控一致率），nominal vs strong。
+
+    这张图承载本篇一号贡献的直接证据，同时也把那个负结果画出来：
+    oracle 在两档都劣于在线估计，说明主导误差是**零阶保持动作**，不是估计质量。
+    数字来源见 outputs_flow/K4_FINDINGS.md（由 flow_validate.py k4 产出）。
+    """
+    # 实测值（写死在这里是有意的：它们来自 K4 的专门诊断跑，不在评测矩阵的 CSV 里）
+    data = {  # (MAE, 门控一致率)
+        "nominal": {"zero": (0.0305, 0.993), "est": (0.0460, 0.974), "oracle": (0.0445, 0.981)},
+        "strong":  {"zero": (0.0797, 0.953), "est": (0.0354, 0.986), "oracle": (0.0900, 0.950)},
+    }
+    order = ["zero", "est", "oracle"]
+    lab = {"zero": "$\\hat{d}=0$", "est": "$\\hat{d}$ online\n(ours)", "oracle": "$\\hat{d}$ oracle"}
+    col = {"zero": PALETTE["neutral"], "est": PALETTE["blue_main"], "oracle": PALETTE["green_3"]}
+    hat = {"zero": "..", "est": "", "oracle": "//"}
+    fig, axes = plt.subplots(1, 2, figsize=(9.2, 3.8))
+    scenes = list(data)
+    x = np.arange(len(scenes)); w = 0.8 / len(order)
+    for ax, idx, ylab in ((axes[0], 0, "Prediction MAE (m) ↓"),
+                          (axes[1], 1, "Gate-decision agreement ↑")):
+        for i, k in enumerate(order):
+            v = [data[s][k][idx] for s in scenes]
+            ax.bar(x + i * w - 0.4 + w / 2, v, w, color=col[k], hatch=hat[k],
+                   edgecolor="black", linewidth=1.0, label=lab[k])
+        ax.set_xticks(x)
+        ax.set_xticklabels(["Nominal gust\n(train dist.)", "Strong gust\n(OOD)"])
+        ax.set_ylabel(ylab)
+    axes[1].set_ylim(0.93, 1.0)
+    axes[0].set_ylim(0, 0.115)                     # 顶部留白，图例不压柱子
+    fig.legend(*axes[0].get_legend_handles_labels(), fontsize=10, ncol=3,
+               loc="upper center", bbox_to_anchor=(0.5, 1.10))
+    fig.tight_layout(rect=(0, 0, 1, 0.93))
+    return finalize(fig, out)
+
+
 def write_md(df, s, out):
     lines = ["# 论文② 结果表", "",
              "> 由 `flow_collect.py` + `flow_report.py` 从 `outputs_flow/eval/*.log` 直接生成，未手工誊写。",
@@ -249,6 +329,8 @@ def main():
     made += fig_dhat(df, figdir / "fig4_observer_ablation")
     made += fig_duty(df, figdir / "fig5_takeover_duty")
     made += fig_training(figdir / "fig6_training_curves")
+    made += fig_calibration(figdir / "fig7_calibration_sweep")
+    made += fig_k4(figdir / "fig8_observer_prediction")
     write_md(df, s, ROOT / "RESULTS.md")
     print(f"表: {ROOT/'RESULTS.md'}  ({len(df)} 行原始结果)")
     for p in made:

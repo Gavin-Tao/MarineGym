@@ -8,13 +8,13 @@
 |---|---|---|---|---|---|---|---|---|
 | PPO | 1 | 0.0156 | 1.2344 | 0.0027 | 0.6533 | 1.6004 | 0.0000 | 574.8906 |
 
-## 场景 strong — Strong gust (OOD amp.)
+## 场景 strong — Strong gust (OOD amplitude)
 
 | method | seeds | Wall-violation rate ↓ | Violating-step fraction ↓ | Cumulative intrusion (m·s) ↓ | Min wall clearance (m) ↑ | Tracking RMSE (m) ↓ | Mean takeover $\lambda$ - | Episode length (steps) - |
 |---|---|---|---|---|---|---|---|---|
 | PPO | 1 | 0.6000 | 47.0308 | 0.2210 | -0.0602 | 2.2553 | 0.0000 | 492.8615 |
 
-## 场景 fast — Fast onset (OOD ramp)
+## 场景 fast — Strong + fast onset (OOD amp. + ramp)
 
 | method | seeds | Wall-violation rate ↓ | Violating-step fraction ↓ | Cumulative intrusion (m·s) ↓ | Min wall clearance (m) ↑ | Tracking RMSE (m) ↓ | Mean takeover $\lambda$ - | Episode length (steps) - |
 |---|---|---|---|---|---|---|---|---|
