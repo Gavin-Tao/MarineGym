@@ -52,14 +52,30 @@ def main():
     else:
         out.append("K1  数据不全（需要 mpc_only/calm 与 ppo/calm）")
 
-    # K2
-    for sc in ("nominal", "strong", "fast"):
+    # K2 —— 分两个判据，因为 nominal 就是策略的训练分布：
+    #  · nominal 违约率**低**才对（分布内 PPO 本来就该安全）。这不是场景失败，
+    #    恰恰是"滤波器只在 OOD 才有价值"这个论点成立的前提。
+    #  · 至少一个 OOD 档要落在可区分区间，否则没有改进空间。
+    v, _, n = _m(df, "ppo", "nominal", HEADLINE)
+    if n:
+        ok = v <= 0.15
+        verdicts["K2.nominal_low"] = ok
+        out.append(f"K2  PPO 违约率 [nominal=训练分布] = {v:.3f}  → {'PASS' if ok else 'FAIL'}  "
+                   f"(需 ≤0.15：分布内应当已经安全)")
+        if not ok:
+            out.append("    ⚠ 训练分布内就大量违约 → 策略欠训练或场景本身不可解，先修这个。")
+    ood_ok = []
+    for sc in ("strong", "fast"):
         v, _, n = _m(df, "ppo", sc, HEADLINE)
         if n:
             ok = a.k2_lo <= v <= a.k2_hi
-            verdicts[f"K2.{sc}"] = ok
-            out.append(f"K2  PPO 违约率 [{sc}] = {v:.3f}  → {'PASS' if ok else 'FAIL'}  "
+            ood_ok.append(ok)
+            out.append(f"K2  PPO 违约率 [{sc}=OOD] = {v:.3f}  → {'PASS' if ok else 'FAIL'}  "
                        f"(需落在 {a.k2_lo:.2f}–{a.k2_hi:.2f})")
+    if ood_ok:
+        verdicts["K2.ood_headroom"] = any(ood_ok)
+        if not any(ood_ok):
+            out.append("    ⚠ 没有任何 OOD 档落在可区分区间 → 跑 run_calibrate.sh 扫阵风幅值重新定档。")
 
     # K3
     for sc in ("strong", "fast"):

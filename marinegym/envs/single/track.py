@@ -169,6 +169,7 @@ class Track(IsaacEnv):
         self.cor_mppi_lo = float(_mpp.get("soft_lo", 0.0))
         self.cor_gate_boundary = float(_mpp.get("soft_hi", 0.6))
         self.cor_mppi_w_ref = float(_mpp.get("w_ref", 0.0))
+        self.cor_mppi_center = str(_mpp.get("center", "rl"))   # rl | prev | zero，见 force_lambda 分支
         _fl = _mpp.get("force_lambda", None)
         self.cor_force_lambda = float(_fl) if _fl is not None else None   # MPC-only 基线设 1.0
         self.cor_mppi_cfg = _mpp
@@ -753,11 +754,19 @@ class Track(IsaacEnv):
                 N = self._cor_mppi.N
                 ref = self._compute_traj(N, step_size=1.)                # [E,N,3]
                 lam = torch.full((self.num_envs, 1), self.cor_force_lambda, device=self.device)
+                # 采样中心：'rl'=策略动作(默认，滤波器语义)；'prev'=上一步实际执行的动作
+                # (标准 MPPI 的一步热启动，与策略无关)；'zero'=完全不借助策略。
+                if self.cor_mppi_center == "prev":
+                    ca = self._cor_prev_a if self._cor_prev_a is not None else torch.zeros_like(u_rl)
+                elif self.cor_mppi_center == "zero":
+                    ca = torch.zeros_like(u_rl)
+                else:
+                    ca = None
                 actions = self._cor_mppi.filter_corridor(
                     self.drone_state, self._cor_hw, u_rl, axis=self.cor_axis,
                     center=float(self.origin[self.cor_axis]),
                     vehicle_radius=self.cor_vehicle_radius, blend=lam, d_hat=self._d_hat,
-                    ref_traj=ref, w_ref=self.cor_mppi_w_ref)
+                    ref_traj=ref, w_ref=self.cor_mppi_w_ref, center_action=ca)
                 self._cor_lam = lam
                 self._cor_corr = ((actions - u_rl) ** 2).sum(-1).reshape(self.num_envs, 1)
                 self._u_rl = u_rl.detach().clone()

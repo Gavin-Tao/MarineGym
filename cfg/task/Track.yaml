@@ -166,3 +166,8 @@ safety:
     w_track: 1.0           # 最小介入项 ‖a−u_rl‖²（作为滤波器时用这个）
     w_ref: 0.0             # 参考跟踪项，仅 MPC-only 基线(λ≡1)开；>0 时 w_track 应设 0
     force_lambda: null     # 非 null 时强制 λ 为该常数（MPC-only 基线设 1.0）
+    center: rl             # MPPI 采样中心：rl=策略动作（滤波器语义，默认）
+                           #   prev=上一步实际动作（标准 MPPI 一步热启动，与策略无关）
+                           #   zero=完全不借助策略。MPC-only 基线必须用 prev 或 zero，
+                           #   否则 w_track=0 时 u_rl 仍通过采样中心影响结果，
+                           #   那就成了"被 RL 热启动的 MPC"，K1 的对照名不副实。

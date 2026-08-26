@@ -133,7 +133,7 @@ class MPPIExactShield:
     @torch.no_grad()
     def filter_corridor(self, drone_state, half_width, u_rl, axis: int = 1, center: float = 0.0,
                         vehicle_radius: float = 0.3, active_mask=None, blend=None, d_hat=None,
-                        ref_traj=None, w_ref: float = 0.0):
+                        ref_traj=None, w_ref: float = 0.0, center_action=None):
         """论文②：keep-in 走廊版本。与 filter() 同一套 MPPI，只换代价里的安全项。
 
         cost = w_coll · Σ_t relu(侵入深度)²  +  w_track · Σ_t ‖a_t − u_rl‖²
@@ -159,7 +159,11 @@ class MPPIExactShield:
         }
         d_k = rep(d_hat) if d_hat is not None else None                       # [E,K,6]
         W = half_width.reshape(E, 1)                                          # [E,1]
-        a_seq = (u0.unsqueeze(2) + self.sigma * torch.randn(E, K, N, M, device=self.device)).clamp(-1, 1)
+        # 采样中心。默认在 u_rl 上（作为**滤波器**时正确：围绕策略提议做局部安全修正）。
+        # MPC-only 基线必须换掉它 —— 否则采样被策略热启动、w_track=0 时 u_rl 仍通过
+        # 采样中心影响结果，那就不是"不用 RL 的 MPC"，K1 的对照名不副实。
+        c0 = u0 if center_action is None else center_action.reshape(E, 1, M)
+        a_seq = (c0.unsqueeze(2) + self.sigma * torch.randn(E, K, N, M, device=self.device)).clamp(-1, 1)
 
         cost = torch.zeros(E, K, device=self.device)
         for t in range(N):

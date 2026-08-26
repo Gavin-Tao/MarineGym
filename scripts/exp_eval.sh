@@ -15,10 +15,10 @@
 #   mpc_only     λ≡1 全程 MPPI + 参考跟踪代价（"为什么不直接用 MPC"的对照）
 #
 # 场景（训练档是 nominal；其余为 OOD）：
-#   nominal  speed[0.6,1.0] ramp[0.2,0.5]
-#   strong   speed[1.5,2.2]              —— 幅值 OOD
-#   fast     ramp[0.08,0.15]             —— 上升沿 OOD（反应式最吃亏的一档）
-#   calm     gust 关闭                    —— 无扰动，测滤波器的"代价"(nominal RMSE)
+#   nominal  speed[0.6,1.0] ramp[0.2,0.5]        —— 训练分布，这里违约率**低**才对
+#   strong   speed[1.5,2.2] ramp[0.2,0.5]        —— 幅值 OOD
+#   fast     speed[1.5,2.2] ramp[0.08,0.15]      —— 幅值+上升沿 OOD；与 strong 只差上升沿
+#   calm     gust 关闭                            —— 无扰动，测滤波器的"代价"(nominal RMSE)
 set -o pipefail
 CELL=${1:?用法: exp_eval.sh <cell> <scene> [seed]}
 SCENE=${2:-nominal}
@@ -48,6 +48,11 @@ esac
 
 # 冻结：门控边界在预测/几何两种门控下必须同值，否则比的是阈值不是门控方式
 G="task.safety.risk.threshold=0.6 task.safety.mppi.soft_hi=0.6"
+# MPPI 规模可覆盖（K×N 决定评测墙钟：完整 128×20 下单格约 40 min，28 个含 MPPI 的
+# 格子要 21 小时）。策略是先用小规模跑通全矩阵，再用完整规模复跑 headline 几格验证
+# 结论不随规模翻转。**同一批结果里所有格子必须用同一组 K/N**，否则比的不是方法。
+[ -n "${MPPI_K:-}" ] && G="$G task.safety.mppi.num_samples=$MPPI_K"
+[ -n "${MPPI_N:-}" ] && G="$G task.safety.mppi.horizon=$MPPI_N"
 case "$CELL" in
   ppo)          CF="task.safety.risk.enable=false task.safety.mppi.enable=false" ;;
   ours)         CF="task.safety.risk.enable=true  task.safety.risk.gate=true  task.safety.mppi.enable=true task.safety.mppi.soft=true  $G" ;;
@@ -56,11 +61,14 @@ case "$CELL" in
   react_binary) CF="task.safety.risk.enable=true  task.safety.risk.gate=false task.safety.mppi.enable=true task.safety.mppi.soft=false $G" ;;
   dhat_zero)    CF="task.safety.risk.enable=true  task.safety.risk.gate=true  task.safety.mppi.enable=true task.safety.mppi.soft=true  task.safety.dobs.zero=true $G" ;;
   dhat_oracle)  CF="task.safety.risk.enable=true  task.safety.risk.gate=true  task.safety.mppi.enable=true task.safety.mppi.soft=true  task.safety.dobs.oracle=true task.safety.dobs.enable=false $G" ;;
-  mpc_only)     CF="task.safety.risk.enable=false task.safety.mppi.enable=true task.safety.mppi.force_lambda=1.0 task.safety.mppi.w_ref=1.0 task.safety.mppi.w_track=0.0 $G" ;;
+  mpc_only)     CF="task.safety.risk.enable=false task.safety.mppi.enable=true task.safety.mppi.force_lambda=1.0 task.safety.mppi.w_ref=1.0 task.safety.mppi.w_track=0.0 task.safety.mppi.center=prev $G" ;;
   *) echo "未知 cell: $CELL"; exit 2 ;;
 esac
 
-LOG="$OUT/${CELL}__${SCENE}__s${SEED}.log"
+SUF=""
+[ -n "${MPPI_K:-}${MPPI_N:-}" ] && SUF="_K${MPPI_K:-def}N${MPPI_N:-def}"
+mkdir -p "$OUT$SUF"
+LOG="$OUT$SUF/${CELL}__${SCENE}__s${SEED}.log"
 if grep -q 'EVAL-ONLY RESULTS' "$LOG" 2>/dev/null; then echo "[skip] $CELL/$SCENE/s$SEED 已完成"; exit 0; fi
 echo "[$(date '+%H:%M:%S')] eval $CELL / $SCENE / s$SEED"
 ${GPU:+CUDA_VISIBLE_DEVICES=$GPU} timeout ${TIMEOUT:-5400} bash "$R" train.py $BASE $SC $CF > "$LOG" 2>&1
