@@ -1,4 +1,4 @@
 cell,scene,stats.wall_violation__mean,stats.wall_violation__std,stats.wall_violation__count,stats.wall_viol_frac__mean,stats.wall_viol_frac__std,stats.wall_viol_frac__count,stats.wall_depth__mean,stats.wall_depth__std,stats.wall_depth__count,stats.min_wall_dist__mean,stats.min_wall_dist__std,stats.min_wall_dist__count,stats.tracking_error_ema__mean,stats.tracking_error_ema__std,stats.tracking_error_ema__count,stats.filter_lambda__mean,stats.filter_lambda__std,stats.filter_lambda__count,stats.episode_len__mean,stats.episode_len__std,stats.episode_len__count
-ppo,nominal,0.0156,,1,1.2344,,1,0.0027,,1,0.6533,,1,1.6004,,1,0.0,,1,574.8906,,1
-ppo,strong,0.6,,1,47.0308,,1,0.221,,1,-0.0602,,1,2.2553,,1,0.0,,1,492.8615,,1
-ppo,fast,0.0156,,1,0.9062,,1,0.0012,,1,0.7092,,1,1.5956,,1,0.0,,1,570.8906,,1
+ppo,calm,0.053,,1,0.053,,1,0.0242,,1,0.7206,,1,0.3408,,1,0.0,,1,575.9015,,1
+mpc_only,calm,0.0,,1,0.0,,1,0.0,,1,0.7486,,1,0.9269,,1,1.0,,1,598.0,,1
+react_soft,calm,0.053,,1,0.053,,1,0.0266,,1,0.721,,1,0.3413,,1,0.0557,,1,575.4318,,1

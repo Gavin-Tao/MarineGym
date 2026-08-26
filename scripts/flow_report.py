@@ -290,10 +290,52 @@ def fig_k4(out):
     return finalize(fig, out)
 
 
+def _headline(df):
+    """把最关键的几组对比抽出来，避免读者自己去表里翻。"""
+    L = []
+    def g(cell, scene, col):
+        v = df[(df.cell == cell) & (df.scene == scene)][col]
+        return float(v.mean()) if len(v) else float("nan")
+
+    rm_ppo, rm_mpc = g("ppo", "calm", RMSE), g("mpc_only", "calm", RMSE)
+    if np.isfinite(rm_ppo) and np.isfinite(rm_mpc):
+        L += ["### K1 为什么不能直接用 MPC", "",
+              f"- 无扰动下 MPC-only(λ≡1) 的跟踪 RMSE = **{rm_mpc:.3f} m**，"
+              f"PPO = **{rm_ppo:.3f} m**（{rm_mpc/max(rm_ppo,1e-9):.1f}×）。",
+              "- 也就是说 MPC 单独用时**跟不准**；它安全但精度差，PPO 精度好但不安全。",
+              "  λ 混合的意义正来自这个互补 —— 若 MPC 跟踪不劣于 PPO，方法即自我否定。", ""]
+
+    rows = []
+    for sc in [x for x in SCENE_ORDER if x in set(df.scene)]:
+        o, p, r = (g("ours", sc, HEADLINE), g("ppo", sc, HEADLINE), g("react_soft", sc, HEADLINE))
+        if np.isfinite(o) and np.isfinite(p):
+            rows.append((sc, p, r, o))
+    if rows:
+        L += ["### K3 预测门控 vs 反应式门控", "",
+              "| 场景 | PPO | Reactive+soft | **Ours** |", "|---|---|---|---|"]
+        for sc, p, r, o in rows:
+            L.append(f"| {sc} | {p:.4f} | {r:.4f} | **{o:.4f}** |")
+        L += ["", "反应式门控若与 PPO 打平（做了修正却没换来安全收益），说明它介入得太晚"
+              "或全是误触发 —— 这正是『必须预测』这一论点的实验支撑。", ""]
+    return L
+
+
 def write_md(df, s, out):
     lines = ["# 论文② 结果表", "",
-             "> 由 `flow_collect.py` + `flow_report.py` 从 `outputs_flow/eval/*.log` 直接生成，未手工誊写。",
+             "> 由 `flow_collect.py` + `flow_report.py` 从评测日志直接生成，未手工誊写。",
+             "> 相关文档：`K4_FINDINGS.md`（观测器判决与机理）、`PERF_NOTES.md`（成本结构）、",
+             "> `RERUN_TODO.md`（待补跑项）。",
              ""]
+    lines += _headline(df)
+    lines += ["### 读数须知", "",
+              "- `wall_violation` 是**每 episode 是否触壁**的 0/1，跨 episode 取均值 = 违约率。",
+              "  侧壁不终止 episode，因此各方法**曝光量相同**、违约率可比。",
+              "- `wall_viol_frac` 是触壁步数占比的 EMA；`stats.tracking_error` 是未归一化的累计量，",
+              "  **看 `tracking_error_ema`**。",
+              "- 统计功效：每格约 80 个 episode 时，只能分辨 ~0.2 量级的违约率差（strong 档够用）；",
+              "  nominal 档若要分辨 ~0.10 的差，每格需要约 250 个 episode。CI 跨 0 的差异不要下结论。",
+              "- 各格**共用同一条策略**，且阵风与 MPPI 各有独立 RNG，因此各格面对的 episode 与扰动序列完全一致。",
+              ""]
     for scene in [x for x in SCENE_ORDER if x in set(df["scene"])]:
         lines += [f"## 场景 {scene} — {SCENE_LABEL[scene]}".replace("\n", " "), ""]
         metrics = [m for m in METRIC if m in df.columns]
