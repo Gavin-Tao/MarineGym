@@ -9,12 +9,12 @@
 # 让三种预测面对不同的执行序列。
 OUT=/home/jovyan/MarineGym-flow/scripts/outputs_flow/k4
 mkdir -p "$OUT"
-STEPS=${STEPS:-600}
+STEPS=${STEPS:-300}
 H=${H:-15}
 ${GPU:+CUDA_VISIBLE_DEVICES=$GPU} timeout 1800 bash /home/jovyan/MarineGym-flow/scripts/run_flow.sh train.py \
   task=Track algo=ppo task.drone_model.name=BlueROV \
   headless=true enable_livestream=false wandb.mode=offline seed=0 \
-  task.env.num_envs=64 \
+  task.env.num_envs=${K4_ENVS:-32} \
   task.corridor.enable=true task.gust.enable=true \
   task.safety.risk.enable=true task.safety.mppi.enable=false \
   task.safety.risk.horizon=$H task.safety.k4=true \
