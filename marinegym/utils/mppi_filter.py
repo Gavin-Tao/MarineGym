@@ -129,6 +129,13 @@ class MPPIExactShield:
         self.w_coll, self.w_track = float(w_coll), float(w_track)
         self.margin = float(activation_margin)
         self.M = drone.num_rotors
+        # MPPI 采样用**独立 generator**，不碰全局 RNG。
+        # 否则 randn(E,K,N,M) 会推进全局流，而环境 reset 的轨迹参数（traj_c/traj_scale/
+        # traj_w/初始姿态）也用全局流 —— 结果是"开滤波器"的格子和 PPO 格子拿到的
+        # **轨迹本身就不同**，消融比的就不只是滤波逻辑了。隔离之后全局流只被环境使用，
+        # 各格的 episode 场景完全一致。
+        self._gen = torch.Generator(device=self.device)
+        self._gen.manual_seed(0x5AFE7)
 
     @torch.no_grad()
     def filter_corridor(self, drone_state, half_width, u_rl, axis: int = 1, center: float = 0.0,
@@ -144,26 +151,60 @@ class MPPIExactShield:
         d_hat [E,1,6]：在线估的体系等效外力残差，零阶保持注入前滚。名义模型对未建模
         洋流是错的，不注入的话 MPPI 采样出的"安全"动作同样不可信。
         """
-        E, K, N, M = drone_state.shape[0], self.K, self.N, self.M
-        if active_mask is not None and not active_mask.any():
-            return u_rl
-        u0 = u_rl.reshape(E, 1, M)
+        E_all, K, N, M = drone_state.shape[0], self.K, self.N, self.M
+        u_rl_flat = u_rl.reshape(E_all, M)
+        # 逐 env 掩码。整批早退（"没有任何 env 触发就跳过"）在 E 大时几乎失效 ——
+        # 只要有一个 env 的 λ>0，整批就付全额 K×N 前滚代价。这里只对真正需要的 env
+        # 跑前滚，其余直接返回 u_rl。
+        # 数值上完全等价：λ=0 时 u = u0 + 0·(u_safe−u0) = u0，与是否算过 u_safe 无关。
+        sel = None
+        if active_mask is not None:
+            m = active_mask.reshape(E_all)
+            if not bool(m.any()):
+                return u_rl
+            if not bool(m.all()):
+                sel = m.nonzero(as_tuple=True)[0]
+        if sel is not None:
+            drone_state = drone_state[sel]
+            half_width = half_width.reshape(E_all, -1)[sel]
+            u_rl_sub = u_rl_flat[sel]
+            if d_hat is not None:
+                d_hat = d_hat.reshape(E_all, -1)[sel]
+            if blend is not None:
+                blend = blend.reshape(E_all, -1)[sel]
+            if ref_traj is not None:
+                ref_traj = ref_traj[sel]
+            if center_action is not None:
+                center_action = center_action.reshape(E_all, -1)[sel]
+        else:
+            u_rl_sub = u_rl_flat
+        E = drone_state.shape[0]
+        u0 = u_rl_sub.reshape(E, 1, M)
+        _vb, _thr, _rpm = self.drone.vel_b, self.drone.throttle, self.drone.rotor_params["rpm"]
+        _vp, _ap = self.drone.prev_body_vels, self.drone.prev_body_acc
 
         def rep(x):
+            x = x.reshape(E_all, -1)
+            if sel is not None:
+                x = x[sel]
+            return x.reshape(E, 1, -1).expand(E, K, -1).clone()
+        # drone_state 已经按 sel 取过子集，这里直接 expand；drone 上的张量还是全量，
+        # 交给 rep() 里的 sel 取子集。
+        def rep_sub(x):
             return x.reshape(E, 1, -1).expand(E, K, -1).clone()
         s = {
-            "pos": rep(drone_state[..., 0:3]), "quat": rep(drone_state[..., 3:7]),
-            "vel_b": rep(self.drone.vel_b), "throttle": rep(self.drone.throttle),
-            "rpm": rep(self.drone.rotor_params["rpm"]),
-            "v_prev": rep(self.drone.prev_body_vels), "acc_prev": rep(self.drone.prev_body_acc),
+            "pos": rep_sub(drone_state[..., 0:3]), "quat": rep_sub(drone_state[..., 3:7]),
+            "vel_b": rep(_vb), "throttle": rep(_thr), "rpm": rep(_rpm),
+            "v_prev": rep(_vp), "acc_prev": rep(_ap),
         }
-        d_k = rep(d_hat) if d_hat is not None else None                       # [E,K,6]
+        d_k = rep_sub(d_hat) if d_hat is not None else None                   # [E,K,6]
         W = half_width.reshape(E, 1)                                          # [E,1]
         # 采样中心。默认在 u_rl 上（作为**滤波器**时正确：围绕策略提议做局部安全修正）。
         # MPC-only 基线必须换掉它 —— 否则采样被策略热启动、w_track=0 时 u_rl 仍通过
         # 采样中心影响结果，那就不是"不用 RL 的 MPC"，K1 的对照名不副实。
         c0 = u0 if center_action is None else center_action.reshape(E, 1, M)
-        a_seq = (c0.unsqueeze(2) + self.sigma * torch.randn(E, K, N, M, device=self.device)).clamp(-1, 1)
+        a_seq = (c0.unsqueeze(2) + self.sigma * torch.randn(E, K, N, M, device=self.device,
+                                                        generator=self._gen)).clamp(-1, 1)
 
         cost = torch.zeros(E, K, device=self.device)
         for t in range(N):
@@ -180,14 +221,22 @@ class MPPIExactShield:
         cost = cost + self.w_track * ((a_seq - u0.unsqueeze(2)) ** 2).sum((-1, -2))
 
         w = torch.softmax(-(cost - cost.min(1, keepdim=True).values) / self.lam, dim=1)
-        u_safe = (w.unsqueeze(-1) * a_seq[:, :, 0]).sum(1)                    # [E,M]
+        u_safe = (w.unsqueeze(-1) * a_seq[:, :, 0]).sum(1)                    # [E,M] 子集上的
 
+        u0f = u0.reshape(E, M)
         if blend is not None:
-            lam_b = blend.reshape(E, 1).clamp(0.0, 1.0)
-            return (u0.reshape(E, M) + lam_b * (u_safe - u0.reshape(E, M))).view_as(u_rl)
-        if active_mask is not None:
-            return torch.where(active_mask.reshape(E, 1), u_safe, u0.reshape(E, M)).view_as(u_rl)
-        return u_safe.view_as(u_rl)
+            out_sub = u0f + blend.reshape(E, 1).clamp(0.0, 1.0) * (u_safe - u0f)
+        elif active_mask is not None:
+            # 走到这里说明 sel 为 None（active_mask 全 True），逐 env 掩码已在入口处理
+            out_sub = u_safe
+        else:
+            out_sub = u_safe
+        if sel is None:
+            return out_sub.view_as(u_rl)
+        # 散射回全量：未参与计算的 env 保持 u_rl（λ=0 时数学上就等于 u_rl）
+        out = u_rl_flat.clone()
+        out[sel] = out_sub
+        return out.view_as(u_rl)
 
     def filter(self, drone_state, obstacle_pos, u_rl, active_mask=None, obstacle_vel=None, blend=None):
         """active_mask [E,1] bool (optional): predictive-risk gate from RiskMonitor (component A).
