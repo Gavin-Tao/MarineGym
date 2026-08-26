@@ -329,6 +329,10 @@ class Track(IsaacEnv):
             self._cor_hw = torch.zeros(E, 1, device=self.device)          # 该 episode 的走廊半宽
             self._cor_clear = torch.zeros(E, 1, device=self.device)       # 到最近侧壁的裕度
             self._cor_violate = torch.zeros(E, 1, dtype=torch.bool, device=self.device)
+            M = self.drone.num_rotors
+            self._u_prev = torch.zeros(E, M, device=self.device)     # 上一步执行的动作
+            self._u_prev2 = torch.zeros(E, M, device=self.device)    # 上上步（算二阶差分）
+            self._u_hist = torch.zeros(E, 1, device=self.device)     # 已积累的历史步数（<2 时不算 jerk）
         if self.gust_enable:
             E = self.num_envs
             self._gust_t0 = torch.zeros(E, 1, device=self.device)         # 起风步
@@ -472,6 +476,22 @@ class Track(IsaacEnv):
             stats_spec_dict["filter_lambda"] = UnboundedContinuousTensorSpec(1)    # 平均接管系数 λ（占空比故事）
             stats_spec_dict["wall_correction"] = UnboundedContinuousTensorSpec(1)  # 平均 ‖u_safe−u_rl‖²
             stats_spec_dict["d_hat_norm"] = UnboundedContinuousTensorSpec(1)       # ‖d̂‖ 观测器输出量级
+            # ── 指标面板（论文②）──────────────────────────────────────────
+            # 安全尾部：峰值侵入 / 首次违约时刻（生存曲线）
+            stats_spec_dict["max_intrusion"] = UnboundedContinuousTensorSpec(1)
+            stats_spec_dict["first_viol_step"] = UnboundedContinuousTensorSpec(1)
+            # 跟踪尾部
+            stats_spec_dict["max_track_err"] = UnboundedContinuousTensorSpec(1)
+            # 平滑度：一阶=动作变化率，二阶=抖振。都算在**执行后**的动作上，
+            # 因此 action_jerk 直接测的就是阶跃接管造成的动作跳变（soft vs binary 的机理判据）。
+            stats_spec_dict["action_rate"] = UnboundedContinuousTensorSpec(1)
+            stats_spec_dict["action_jerk"] = UnboundedContinuousTensorSpec(1)
+            # 执行器：饱和占比 / 控制努力 / 平均功率
+            stats_spec_dict["sat_frac"] = UnboundedContinuousTensorSpec(1)
+            stats_spec_dict["effort"] = UnboundedContinuousTensorSpec(1)
+            stats_spec_dict["power_W"] = UnboundedContinuousTensorSpec(1)
+            # 滤波器占空比（λ>0.05 的步数占比，与平均 λ 不同）
+            stats_spec_dict["engage_frac"] = UnboundedContinuousTensorSpec(1)
         if self.gust_enable:
             stats_spec_dict["gust_speed"] = UnboundedContinuousTensorSpec(1)       # 当前阵风幅值 |v_c| EMA
         stats_spec = CompositeSpec(stats_spec_dict).expand(self.num_envs).to(self.device)
@@ -571,6 +591,10 @@ class Track(IsaacEnv):
             self._cor_hw[env_ids] = (self._ref_axis_extent(env_ids)
                                      + self.cor_vehicle_radius + self.cor_margin)
         self.stats["min_wall_dist"][env_ids] = 100.0   # 取 min 的累计量，须初始化为大值
+        self.stats["first_viol_step"][env_ids] = -1.0  # −1 = 整个 episode 未违约（画生存曲线时按删失处理）
+        self._u_prev[env_ids] = 0.
+        self._u_prev2[env_ids] = 0.
+        self._u_hist[env_ids] = 0.
         # reset 那一步速度会跳变，残差会是垃圾；清掉 d̂ 与上一步状态，避免污染下一 episode
         if getattr(self, "_dobs", None) is not None:
             self._dobs.reset(env_ids)
@@ -889,7 +913,35 @@ class Track(IsaacEnv):
             self._val_rpm = self.drone.rotor_params["rpm"].clone()
             self._val_vprev = self.drone.prev_body_vels.clone()
             self._val_aprev = self.drone.prev_body_acc.clone()
+        # ── 指标面板：平滑度 / 执行器 / 占空比（都算在**执行后**的动作上）──────
+        if self.corridor_enable:
+            _u = actions.reshape(self.num_envs, -1)
+            _n = 1 - self.alpha                              # EMA 系数，与其它 stats 同约定
+            _has1 = (self._u_hist >= 1).float()
+            _has2 = (self._u_hist >= 2).float()
+            # 一阶差分=动作变化率；二阶差分=抖振。历史不足时按 0 计，避免 reset 后的假尖峰。
+            _rate = (_u - self._u_prev).norm(dim=-1, keepdim=True) * _has1
+            _jerk = (_u - 2 * self._u_prev + self._u_prev2).norm(dim=-1, keepdim=True) * _has2
+            self.stats["action_rate"].lerp_(_rate, _n)
+            self.stats["action_jerk"].lerp_(_jerk, _n)
+            self.stats["sat_frac"].lerp_((_u.abs() > 0.95).float().mean(-1, keepdim=True), _n)
+            self.stats["effort"].lerp_((_u ** 2).sum(-1, keepdim=True), _n)
+            if hasattr(self, "_cor_lam"):
+                self.stats["engage_frac"].lerp_((self._cor_lam > 0.05).float(), _n)
+            self._u_prev2 = self._u_prev
+            self._u_prev = _u.detach().clone()
+            self._u_hist = (self._u_hist + 1).clamp_max(3)
+
         self.effort = torch.abs(self.drone.apply_action(actions))
+        if self.corridor_enable:
+            # T200 功率代理：|推力| × |指令|，逐推进器求和。论文里只作**相对比较**，
+            # 不当绝对功率读（真实功率还要过电机效率曲线）。必须在 apply_action 之后取，
+            # thrusts 是在其中写入的。
+            self.stats["power_W"].lerp_(
+                (self.drone.thrusts[..., 0].reshape(self.num_envs, -1).abs()
+                 * actions.reshape(self.num_envs, -1).abs()).sum(-1, keepdim=True),
+                1 - self.alpha)
+
 
         if self.wind:
             t = (self.progress_buf * self.dt).reshape(-1, 1, 1)
@@ -1026,6 +1078,15 @@ class Track(IsaacEnv):
             self.stats["wall_viol_frac"].lerp_(v, (1 - self.alpha))
             self.stats["wall_depth"] += (-self._cor_clear).clamp_min(0.) * self.dt
             self.stats["min_wall_dist"] = torch.minimum(self.stats["min_wall_dist"], self._cor_clear)
+            # 峰值侵入深度（累计量 wall_depth 之外再给一个尾部指标）
+            self.stats["max_intrusion"] = torch.maximum(
+                self.stats["max_intrusion"], (-self._cor_clear).clamp_min(0.))
+            self.stats["max_track_err"] = torch.maximum(
+                self.stats["max_track_err"], self.rpos[:, 0].norm(dim=-1, keepdim=True))
+            # 首次违约时刻：只在"尚未记录(−1)且本步违约"时写入
+            _p = self.progress_buf.unsqueeze(-1).float()
+            _first = (self.stats["first_viol_step"] < 0) & self._cor_violate
+            self.stats["first_viol_step"] = torch.where(_first, _p, self.stats["first_viol_step"])
             if hasattr(self, "_cor_lam"):
                 self.stats["filter_lambda"].lerp_(self._cor_lam, (1 - self.alpha))
                 self.stats["wall_correction"].lerp_(self._cor_corr, (1 - self.alpha))
